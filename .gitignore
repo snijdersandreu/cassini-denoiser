@@ -1,0 +1,13 @@
+# IDE dirs
+.idea/
+.vs/
+
+# Virtual env
+venv/
+.venv/
+
+# Output dirs
+out*/
+
+# Data dirs
+data/
