@@ -1,0 +1,8 @@
+astropy
+numpy
+matplotlib
+scipy
+pandas
+pillow
+pyinstaller
+scikit-image
