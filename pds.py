@@ -20,16 +20,17 @@ import matplotlib.pyplot as plt
 def parse_header(header_file_path):
     """
     Parse the header file to extract configuration parameters.
+    Supports both uncalibrated (8-bit with line prefixes) and calibrated (32-bit, no prefix) images.
     """
-
-    # Set of required configuration parameters
+    # Set of required parameters. Defaults: line_prefix_bytes=0 if not provided.
     config_params = {
         "record_length": None,
         "image_start_record": None,
         "lines": None,
         "line_samples": None,
         "sample_bits": None,
-        "line_prefix_bytes": None
+        "line_prefix_bytes": 0,  # default to 0 if header has no such entry (as in calibrated images)
+        "sample_type": None
     }
 
     # Open header file and read all the contents
@@ -38,11 +39,13 @@ def parse_header(header_file_path):
 
     # Parse the required lines
     for line in header_content:
+        line = line.strip()
         if "RECORD_BYTES" in line:
             config_params["record_length"] = int(line.split('=')[1].strip())
         elif "^IMAGE" in line:
+            # Format: ^IMAGE = ("FILENAME",record)
             config_params["image_start_record"] = int(line.split('=')[1].split(',')[1].split(')')[0].strip())
-        elif "LINES" in line:
+        elif line.startswith("LINES") and config_params["lines"] is None:
             config_params["lines"] = int(line.split('=')[1].strip())
         elif "LINE_SAMPLES" in line:
             config_params["line_samples"] = int(line.split('=')[1].strip())
@@ -50,6 +53,9 @@ def parse_header(header_file_path):
             config_params["sample_bits"] = int(line.split('=')[1].strip())
         elif "LINE_PREFIX_BYTES" in line:
             config_params["line_prefix_bytes"] = int(line.split('=')[1].strip())
+        elif "SAMPLE_TYPE" in line:
+            # Remove quotes if present.
+            config_params["sample_type"] = line.split('=')[1].strip().strip('"')
 
     # Return configuration parameters
     return config_params
@@ -58,30 +64,53 @@ def parse_header(header_file_path):
 # Read a PDS image from a binary file
 def read_image(header_file_path, image_file_path):
     """
-    Process the image using the parameters from the header file.
+    Read a PDS image from a binary file.
+    This generalized function supports both uncalibrated (8-bit with a prefix) and calibrated (32-bit PC_REAL) images.
     """
 
     # Parse the header file for configuration parameters
     config = parse_header(header_file_path)
 
-    # Define the data array for the image
-    image_array = np.zeros((config["lines"], config["line_samples"]), dtype=np.uint8)
+    # Determine the number of bytes per sample and the numpy data type from SAMPLE_BITS (and SAMPLE_TYPE, if needed)
+    sample_bits = config["sample_bits"]
+    if sample_bits == 8:
+        sample_dtype = np.uint8
+        sample_byte_size = 1
+    elif sample_bits == 16:
+        sample_dtype = np.uint16
+        sample_byte_size = 2
+    elif sample_bits == 32:
+        # Typically calibrated images use PC_REAL which we interpret as 32-bit float
+        sample_dtype = np.float32
+        sample_byte_size = 4
+    else:
+        raise ValueError("Unsupported SAMPLE_BITS value: {}".format(sample_bits))
 
-    # Open binary file for reading
+    lines = config["lines"]
+    samples = config["line_samples"]
+    prefix_bytes = config.get("line_prefix_bytes", 0)
+
+    # Allocate array to hold the image; note that for calibrated images the file includes an extra non-image row.
+    image_array = np.zeros((lines, samples), dtype=sample_dtype)
+
+    # Calculate offset where the image payload starts
+    image_start_offset = config["record_length"] * (config["image_start_record"] - 1)
+
     with open(image_file_path, 'rb') as file:
-
-        # Skipp non-image data
-        file.seek(config["record_length"] * (config["image_start_record"] - 1))
-
-        # Read each line of the image
-        for line in range(config["lines"]):
-
-            # Skip the line prefix
-            file.read(config["line_prefix_bytes"])
-
-            # Read the line data
-            line_data = file.read(config["line_samples"])
-            image_array[line, :] = np.frombuffer(line_data, dtype=np.uint8)
+        file.seek(image_start_offset)
+        # For calibrated images (SAMPLE_TYPE 'PC_REAL'), skip one extra row that holds non-image information.
+        if config.get("sample_type", "").upper() == "PC_REAL":
+            file.read(samples * sample_byte_size)
+        for i in range(lines):
+            # For uncalibrated images, skip the line prefix bytes; for calibrated images prefix_bytes is 0.
+            if prefix_bytes > 0:
+                file.read(prefix_bytes)
+            # Read one full line (note that each sample occupies sample_byte_size bytes)
+            line_data = file.read(samples * sample_byte_size)
+            if len(line_data) != samples * sample_byte_size:
+                raise ValueError("Incomplete data for line {}: expected {} bytes, got {} bytes".format(
+                    i, samples * sample_byte_size, len(line_data)))
+            image_array[i, :] = np.frombuffer(line_data, dtype=sample_dtype, count=samples)
 
     # Return the processed image
     return image_array
@@ -90,36 +119,43 @@ def read_image(header_file_path, image_file_path):
 # Write an updated image stream into a binary file, keeping the header information of the original file
 def save_image(image_data, new_image_file_path, original_image_file_path, header_file_path):
     """
-    Save the modified image data into a file, preserving the original format and structure.
-
-    :param image_data: Numpy array containing the modified image data.
-    :param original_image_file_path: Path to the original image file.
-    :param new_image_file_path: Path where the new image file will be saved.
-    :param header_file_path: Path where the header file will be saved.
+    Save the modified image data into a new binary file, preserving the original header and structure.
+    This version adapts to both calibrated (no line prefix) and uncalibrated (with line prefix) formats.
     """
 
     # Parse the header file for configuration parameters
     config = parse_header(header_file_path)
 
-    # Open original/new image files for reading/writing
-    with open(original_image_file_path, 'rb') as original_file, open(new_image_file_path, 'wb') as new_file:
+    # Determine sample byte size based on SAMPLE_BITS.
+    sample_bits = config["sample_bits"]
+    if sample_bits == 8:
+        sample_byte_size = 1
+    elif sample_bits == 16:
+        sample_byte_size = 2
+    elif sample_bits == 32:
+        sample_byte_size = 4
+    else:
+        raise ValueError("Unsupported SAMPLE_BITS value: {}".format(sample_bits))
 
-        # Copy the initial non-image part of the file
-        original_file.seek(0)
-        non_image_data = original_file.read(config['record_length'] * (config['image_start_record'] - 1))
-        new_file.write(non_image_data)
+    lines = config["lines"]
+    samples = config["line_samples"]
+    prefix_bytes = config.get("line_prefix_bytes", 0)
 
-        # Write modified image data with line prefixes
-        for line in range(config["lines"]):
+    with open(original_image_file_path, 'rb') as orig_file, open(new_image_file_path, 'wb') as new_file:
+        # Copy the non-image (header) portion of the file.
+        header_offset = config["record_length"] * (config["image_start_record"] - 1)
+        orig_file.seek(0)
+        new_file.write(orig_file.read(header_offset))
 
-            # Copy the line prefix from the original file
-            original_file.seek(config['record_length'] * (config['image_start_record'] - 1) +
-                               line * (config['line_samples'] + config['line_prefix_bytes']))
-            line_prefix = original_file.read(config['line_prefix_bytes'])
-            new_file.write(line_prefix)
-
-            # Write the modified line data
-            new_file.write(image_data[line, :])
+        for i in range(lines):
+            # For uncalibrated images, copy the line prefix.
+            if prefix_bytes > 0:
+                seek_offset = header_offset + i * (prefix_bytes + samples * sample_byte_size)
+                orig_file.seek(seek_offset)
+                prefix = orig_file.read(prefix_bytes)
+                new_file.write(prefix)
+            # Write the image data line. Convert the numpy row to bytes.
+            new_file.write(image_data[i, :].tobytes())
 
 
 # Plot a PDS image
