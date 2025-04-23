@@ -11,3 +11,9 @@ out*/
 
 # Data dirs
 data/
+
+# Python Cache
+__pycache__/
+
+# temp ignore
+denoising_algorithms/
