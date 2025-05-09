@@ -9,7 +9,10 @@ from scipy.stats import norm, probplot
 import csv
 import uuid
 import matplotlib.pyplot as plt
+import pandas as pd
 
+# Import the new utility function
+from image_utils import create_display_image 
 
 # Path Definitions
 LOGS_CSV_PATH = "/Volumes/PortableSSD/uni/TFG/cassini-denoiser/data/patch_logs.csv"
@@ -17,6 +20,8 @@ LOGS_CSV_PATH = "/Volumes/PortableSSD/uni/TFG/cassini-denoiser/data/patch_logs.c
 # External modules
 import pds
 import noise_analysis  # Adjust to match your actual module / function names
+# For the denoising window
+from denoise_window import DenoiseWindow
 
 # For histogram + Gaussian fitting
 from matplotlib.figure import Figure
@@ -29,11 +34,19 @@ class PDSImageViewer(tk.Tk):
         super().__init__()
         self.title("PDS Image Viewer with Region Noise Analysis")
 
+        # Create main container that will hold both current layout and patches list
+        main_container = ttk.Frame(self)
+        main_container.pack(expand=True, fill='both', padx=5, pady=5)
+
+        # ============== TOP FRAME (existing content) ==============
+        top_frame = ttk.Frame(main_container)
+        top_frame.pack(fill='both', expand=True)
+
         # ============== LAYOUT: LEFT FRAME (noise/histogram), RIGHT FRAME (image/nav) ==============
-        self.left_frame = ttk.Frame(self, padding="5")
+        self.left_frame = ttk.Frame(top_frame, padding="5")
         self.left_frame.grid(row=0, column=0, sticky=tk.N+tk.S)
 
-        self.right_frame = ttk.Frame(self, padding="5")
+        self.right_frame = ttk.Frame(top_frame, padding="5")
         self.right_frame.grid(row=0, column=1, sticky=tk.N+tk.S+tk.E+tk.W)
 
         # ============== LEFT FRAME CONTENT (noise histogram, etc.) ==============
@@ -108,6 +121,10 @@ class PDSImageViewer(tk.Tk):
         ttk.Button(self.zoom_frame, text="Zoom Q4", command=lambda: self.set_zoom("Q4")).grid(row=0, column=3, padx=2)
         ttk.Button(self.zoom_frame, text="Reset Zoom", command=lambda: self.set_zoom(None)).grid(row=0, column=4, padx=2)
 
+        # Denoise Image button
+        self.denoise_btn = ttk.Button(self.right_frame, text="Denoise Image", command=self.open_denoise_window)
+        self.denoise_btn.grid(row=3, column=0, columnspan=3, pady=5)
+
         # Keep a list of (lbl_path, img_path)
         self.image_pairs = []
         self.current_index = 0
@@ -126,6 +143,61 @@ class PDSImageViewer(tk.Tk):
         self.image_canvas.bind("<Button-1>", self.on_mouse_down)
         self.image_canvas.bind("<B1-Motion>", self.on_mouse_drag)
         self.image_canvas.bind("<ButtonRelease-1>", self.on_mouse_up)
+
+        # ============== BOTTOM FRAME (patches list) ==============
+        bottom_frame = ttk.LabelFrame(main_container, text="Logged Noise Patches", padding="5")
+        bottom_frame.pack(fill='x', pady=(10, 0))
+
+        # Add statistics summary frame
+        self.stats_frame = ttk.Frame(bottom_frame)
+        self.stats_frame.pack(fill='x', pady=(0, 5))
+        
+        # Create labels for each statistic
+        self.stats_labels = {}
+        stats_names = ["Skewness", "Kurtosis", "Noise Std", "P-Value"]
+        for i, name in enumerate(stats_names):
+            container = ttk.Frame(self.stats_frame)
+            container.pack(side='left', padx=10)
+            ttk.Label(container, text=f"{name}:", font=('Helvetica', 9, 'bold')).pack(side='left')
+            self.stats_labels[name] = ttk.Label(container, text="No data", font=('Helvetica', 9))
+            self.stats_labels[name].pack(side='left', padx=(5, 0))
+
+        # Create Treeview for patches
+        self.patches_tree = ttk.Treeview(
+            bottom_frame,
+            columns=("filename", "location", "mean", "std", "skew", "kurt", "pval"),
+            show="headings",
+            height=5  # Show 5 rows by default
+        )
+
+        # Configure columns
+        self.patches_tree.heading("filename", text="Filename")
+        self.patches_tree.heading("location", text="Location (x0,y0,x1,y1)")
+        self.patches_tree.heading("mean", text="Mean")
+        self.patches_tree.heading("std", text="Std")
+        self.patches_tree.heading("skew", text="Skewness")
+        self.patches_tree.heading("kurt", text="Kurtosis")
+        self.patches_tree.heading("pval", text="p-value")
+
+        # Set column widths
+        self.patches_tree.column("filename", width=150)
+        self.patches_tree.column("location", width=150)
+        self.patches_tree.column("mean", width=80)
+        self.patches_tree.column("std", width=80)
+        self.patches_tree.column("skew", width=80)
+        self.patches_tree.column("kurt", width=80)
+        self.patches_tree.column("pval", width=80)
+
+        # Add scrollbar
+        scrollbar = ttk.Scrollbar(bottom_frame, orient="vertical", command=self.patches_tree.yview)
+        self.patches_tree.configure(yscrollcommand=scrollbar.set)
+
+        # Pack the Treeview and scrollbar
+        self.patches_tree.pack(side='left', fill='x', expand=True)
+        scrollbar.pack(side='right', fill='y')
+
+        # Load existing patches
+        self.load_patches()
 
         if start_directory:
             self.load_directory(start_directory)
@@ -189,17 +261,11 @@ class PDSImageViewer(tk.Tk):
         self.current_image_data = image_data
         self.original_height, self.original_width = image_data.shape
 
-        # 2) Contrast stretch via percentiles (for display only)
-        p1, p99 = np.percentile(image_data, (1, 99))
-        if p99 - p1 < 1e-8:
-            disp_clamped = np.clip(image_data, 0, 255).astype("uint8")
-        else:
-            scaled = (image_data - p1) / (p99 - p1)
-            scaled_clamped = np.clip(scaled, 0, 1) * 255
-            disp_clamped = scaled_clamped.astype("uint8")
+        # 2) Contrast stretch using the utility function for display
+        disp_uint8 = create_display_image(image_data, method='percentile')
 
         # Crop only for display (preserve full original image in memory)
-        display_data = disp_clamped
+        display_data = disp_uint8 # Already uint8
         if self.zoom_state:
             h, w = display_data.shape
             half_h, half_w = h // 2, w // 2
@@ -436,7 +502,7 @@ class PDSImageViewer(tk.Tk):
             bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.7)
         )
 
-        self.noise_ax.set_title("Noise Histogram (Selected Region)")
+        self.noise_ax.set_title("Noise Histogram (Residual)")
         self.noise_ax.set_xlabel("Noise value")
         self.noise_ax.set_ylabel("Density")
         self.noise_ax.legend(loc='upper left')
@@ -453,26 +519,18 @@ class PDSImageViewer(tk.Tk):
         self.noise_ax.set_title("Noise Histogram (No region selected)")
         self.noise_canvas.draw()
 
-    def scale_to_8bit(self, arr):
-        arrf = arr.astype(np.float32)
-        min_val = arrf.min()
-        max_val = arrf.max()
-        if max_val - min_val < 1e-10:
-            return np.zeros_like(arrf, dtype=np.uint8)
-        scaled = (arrf - min_val) / (max_val - min_val)
-        scaled *= 255.0
-        return scaled.astype(np.uint8)
-
     def update_small_images(self, patch, plane, residual):
         """
         Show three images in the small figures:
         1) Original patch
         2) Fitted plane
         3) Residual
+        All using min-max scaling for clarity.
         """
-        patch_8 = self.scale_to_8bit(patch)
-        plane_8 = self.scale_to_8bit(plane)
-        residual_8 = self.scale_to_8bit(residual)
+        # Use create_display_image with 'minmax' for these previews
+        patch_8 = create_display_image(patch, method='minmax')
+        plane_8 = create_display_image(plane, method='minmax')
+        residual_8 = create_display_image(residual, method='minmax')
 
         images = [patch_8, plane_8, residual_8]
         titles = ["Patch", "Fitted Plane", "Residual"]
@@ -501,33 +559,90 @@ class PDSImageViewer(tk.Tk):
         canvas.draw()
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
+    def update_stats_summary(self):
+        """Update the statistics summary from the CSV data"""
+        try:
+            if os.path.exists(LOGS_CSV_PATH):
+                df = pd.read_csv(LOGS_CSV_PATH)
+                
+                # Convert relevant columns to float
+                columns_to_convert = ["skew", "kurt", "std", "pval"]
+                for col in columns_to_convert:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+                
+                # Drop rows with NaN values
+                df = df.dropna(subset=columns_to_convert)
+                
+                if not df.empty:
+                    # Compute statistics
+                    summary = {
+                        "Skewness": (df["skew"].mean(), df["skew"].std()),
+                        "Kurtosis": (df["kurt"].mean(), df["kurt"].std()),
+                        "Noise Std": (df["std"].mean(), df["std"].std()),
+                        "P-Value": (df["pval"].mean(), df["pval"].std())
+                    }
+                    
+                    # Update labels
+                    for metric, (mean, std) in summary.items():
+                        self.stats_labels[metric].configure(
+                            text=f"μ={mean:.2e} σ={std:.2e}"
+                        )
+                else:
+                    for label in self.stats_labels.values():
+                        label.configure(text="No data")
+            else:
+                for label in self.stats_labels.values():
+                    label.configure(text="No data")
+        except Exception as e:
+            print(f"Error updating stats summary: {e}")
+            for label in self.stats_labels.values():
+                label.configure(text="Error")
+
+    def load_patches(self):
+        """Load and display patches from the CSV file"""
+        try:
+            # Clear existing items
+            for item in self.patches_tree.get_children():
+                self.patches_tree.delete(item)
+
+            # Read CSV if it exists
+            if os.path.exists(LOGS_CSV_PATH):
+                with open(LOGS_CSV_PATH, mode="r", newline="") as csvfile:
+                    reader = csv.DictReader(csvfile)
+                    for row in reader:
+                        # Format location string
+                        location = f"({row['orig_x0']},{row['orig_y0']},{row['orig_x1']},{row['orig_y1']})"
+                        
+                        # Format values with appropriate precision
+                        self.patches_tree.insert("", "end", values=(
+                            row['filename'],
+                            location,
+                            f"{float(row['mean']):.2e}",
+                            f"{float(row['std']):.2e}",
+                            f"{float(row['skew']):.2f}",
+                            f"{float(row['kurt']):.2f}",
+                            f"{float(row['pval']):.2e}"
+                        ))
+                
+                # Update statistics summary
+                self.update_stats_summary()
+        except Exception as e:
+            print(f"Error loading patches: {e}")
+
     def log_current_patch(self):
-        """Log the most recent patch data to a CSV, without saving a Q-Q plot."""
+        """Log the most recent patch data to a CSV and update the display"""
         if not self.last_patch_info:
             print("No patch data to log.")
             return
 
         patch_data = self.last_patch_info
 
-        # Commenting out the Q-Q plot generation and saving
-        # 1) Generate a unique name for the Q-Q plot
-        # plot_name = f"qq_{patch_data['filename']}_{patch_data['orig_x0']}_{patch_data['orig_y0']}_{uuid.uuid4().hex[:6]}.png"
-
-        # 2) Create the Q-Q plot and save it
-        # fig = plt.figure(figsize=(4, 4))
-        # ax = fig.add_subplot(111)
-        # probplot(patch_data["residual"], dist="norm", plot=ax)
-        # ax.set_title(f"Q-Q Plot for patch {patch_data['orig_x0']}:{patch_data['orig_y0']}")
-        # fig.savefig(os.path.join(QQ_PLOT_DIR, plot_name), dpi=100, bbox_inches="tight")
-        # plt.close(fig)
-
-        # 3) Write to CSV
-        # Check if the CSV already exists => if not, write a header
+        # Write to CSV
         file_exists = os.path.exists(LOGS_CSV_PATH)
         with open(LOGS_CSV_PATH, mode="a", newline="") as csvfile:
             fieldnames = [
                 "filename", "orig_x0", "orig_x1", "orig_y0", "orig_y1",
-                "mean", "std", "skew", "kurt", "pval"  # Remove 'qq_plot' from here if not saving
+                "mean", "std", "skew", "kurt", "pval"
             ]
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
 
@@ -544,11 +659,19 @@ class PDSImageViewer(tk.Tk):
                 "std": patch_data["std"],
                 "skew": patch_data["skew"],
                 "kurt": patch_data["kurt"],
-                "pval": patch_data["pval"],
-                # "qq_plot": plot_name  # Remove this line if not saving the Q-Q plot
+                "pval": patch_data["pval"]
             })
-        print(f"Patch logged to {LOGS_CSV_PATH} without saving a QQ plot.")
+
+        # Reload the patches display and update statistics
+        self.load_patches()
+        print(f"Patch logged to {LOGS_CSV_PATH}")
     
+    def open_denoise_window(self):
+        """Open a separate window for testing denoising algorithms."""
+        if self.current_image_data is None:
+            return
+        DenoiseWindow(self, image_data=self.current_image_data)
+        
 def main():
     viewer = PDSImageViewer()
     viewer.mainloop()

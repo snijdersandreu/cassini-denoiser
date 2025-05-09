@@ -14,6 +14,8 @@ data/
 
 # Python Cache
 __pycache__/
+denoising_algorithms/__pycache__/
 
-# temp ignore
-denoising_algorithms/
+# LUT files
+LUT/
+
