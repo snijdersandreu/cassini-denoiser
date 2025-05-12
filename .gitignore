@@ -11,6 +11,7 @@ out*/
 
 # Data dirs
 data/
+histogram_plots/
 
 # Python Cache
 __pycache__/
