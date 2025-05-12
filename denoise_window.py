@@ -24,12 +24,13 @@ from image_utils import create_display_image
 
 
 class DenoiseWindow(tk.Toplevel):
-    def __init__(self, master, image_data=None):
+    def __init__(self, master, image_data=None, clean_image_data=None):
         super().__init__(master)
         self.title("Denoise & Compare")
         # image_data is a numpy array: float64 for calibrated (32-bit) images,
         # or uint8/uint16 promoted to float64 for uncalibrated images
         self.image_data = image_data
+        self.clean_image_data = clean_image_data  # Clean reference image (if available)
         self.preview_size = 256
         # self.hist_size = 100  # Height of the histogram - Now using Matplotlib for PSD
         self.controls_visible = True  # State for the control panel visibility
@@ -483,7 +484,17 @@ class DenoiseWindow(tk.Toplevel):
         # but if rescaling disabled, display original_arr
         display_data_original = arr if self.rescale_var.get() else original_arr
         
-        # Show original first (either unscaled or rescaled depending on checkbox)
+        # If clean reference image is available, display it first
+        if self.clean_image_data is not None:
+            # If rescaling is enabled, also rescale the clean reference
+            if self.rescale_var.get():
+                # Use same scaling parameters as for the noisy image
+                clean_arr = (self.clean_image_data - self.p1) / self.scale_factor
+                self.show_result("Clean Reference", clean_arr, original_data=display_data_original)
+            else:
+                self.show_result("Clean Reference", self.clean_image_data, original_data=display_data_original)
+
+        # Show original next (either unscaled or rescaled depending on checkbox)
         # Pass the appropriate original data reference (needed for comparisons later)
         self.show_result("Original Image", display_data_original, original_data=display_data_original)
 

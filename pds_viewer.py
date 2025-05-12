@@ -54,9 +54,17 @@ class PDSImageViewer(tk.Tk):
         self.directory_label = ttk.Label(self.left_frame, text="No directory selected")
         self.directory_label.grid(row=0, column=0, sticky=tk.W, pady=5)
 
-        # 2) Buttons
-        self.browse_btn = ttk.Button(self.left_frame, text="Browse Directory", command=self.browse_directory)
-        self.browse_btn.grid(row=1, column=0, pady=5, sticky=tk.W)
+        # 2) Buttons Frame
+        buttons_frame = ttk.Frame(self.left_frame)
+        buttons_frame.grid(row=1, column=0, pady=5, sticky=tk.W)
+        
+        # Browse Directory button
+        self.browse_btn = ttk.Button(buttons_frame, text="Browse Directory", command=self.browse_directory)
+        self.browse_btn.grid(row=0, column=0, padx=(0, 5))
+        
+        # New button for browsing NPZ files
+        self.browse_npz_btn = ttk.Button(buttons_frame, text="Browse NPZ Files", command=self.browse_npz_files)
+        self.browse_npz_btn.grid(row=0, column=1)
 
         # 3) File label
         self.file_label_var = tk.StringVar(value="No file loaded")
@@ -125,9 +133,13 @@ class PDSImageViewer(tk.Tk):
         self.denoise_btn = ttk.Button(self.right_frame, text="Denoise Image", command=self.open_denoise_window)
         self.denoise_btn.grid(row=3, column=0, columnspan=3, pady=5)
 
-        # Keep a list of (lbl_path, img_path)
-        self.image_pairs = []
+        # Keep track of image files and file types
+        self.image_pairs = []  # Will hold (header_path, image_path) pairs for PDS or (npz_path, 'npz') for NPZ files
+        self.file_types = []  # Will hold 'pds' or 'npz' for each item in image_pairs
         self.current_index = 0
+        
+        # For NPZ files, we also need to store the clean image for comparison
+        self.clean_image_data = None
 
         # Store the raw (unscaled) image data for noise analysis
         self.current_image_data = None  
@@ -199,6 +211,7 @@ class PDSImageViewer(tk.Tk):
         # Load existing patches
         self.load_patches()
 
+        # If a starting directory was provided, load it
         if start_directory:
             self.load_directory(start_directory)
             
@@ -207,14 +220,40 @@ class PDSImageViewer(tk.Tk):
         self.log_patch_btn.grid(row=6, column=0, pady=5, sticky=tk.W)
     # ========================== DIRECTORY AND IMAGE LIST ==========================
     def browse_directory(self):
-        selected_dir = filedialog.askdirectory()
-        if selected_dir:
-            self.load_directory(selected_dir)
+        """Browse for a directory containing PDS image files."""
+        directory = filedialog.askdirectory()
+        if directory:
+            self.load_directory(directory)
+            
+    def browse_npz_files(self):
+        """Browse for NPZ files containing clean-noisy image pairs."""
+        npz_files = filedialog.askopenfilenames(
+            title="Select NPZ Files",
+            filetypes=[("NPZ Files", "*.npz")]
+        )
+        if npz_files:
+            # Clear existing image pairs
+            self.image_pairs = []
+            self.file_types = []
+            
+            # Add selected NPZ files
+            for npz_path in npz_files:
+                self.image_pairs.append((npz_path, 'npz'))
+                self.file_types.append('npz')
+            
+            # Update the directory label
+            self.directory_label.configure(text=f"NPZ Files: {len(self.image_pairs)} selected")
+            
+            # Show the first image
+            if self.image_pairs:
+                self.current_index = 0
+                self.show_image(0)
 
     def load_directory(self, directory):
         """Scan for all .LBL files in the directory and find matching .IMG files."""
         self.directory_label.configure(text=f"Directory: {directory}")
-        self.image_pairs.clear()
+        self.image_pairs = []
+        self.file_types = []
         self.current_index = 0
 
         lbl_files = glob.glob(os.path.join(directory, "*.LBL")) + glob.glob(os.path.join(directory, "*.lbl"))
@@ -225,12 +264,14 @@ class PDSImageViewer(tk.Tk):
                 possible_img = base_name + ".img"
             if os.path.exists(possible_img):
                 self.image_pairs.append((lbl_path, possible_img))
+                self.file_types.append('pds')
 
         if self.image_pairs:
             self.show_image(0)
         else:
             self.file_label_var.set("No .lbl/.img pairs found.")
             self.current_image_data = None
+            self.clean_image_data = None
             self.clear_noise_histogram()
 
     # ========================== IMAGE DISPLAY ==========================
@@ -252,17 +293,48 @@ class PDSImageViewer(tk.Tk):
 
     def show_image(self, index):
         """Load the image pair, apply contrast stretch, display in the canvas."""
-        lbl_path, img_path = self.image_pairs[index]
-        filename = os.path.basename(lbl_path)
-        self.file_label_var.set(f"File: {filename}")
+        if not self.image_pairs:
+            return
+            
+        file_pair = self.image_pairs[index]
+        file_type = self.file_types[index]
+        
+        if file_type == 'pds':
+            # Handle PDS files (LBL/IMG pairs)
+            lbl_path, img_path = file_pair
+            filename = os.path.basename(lbl_path)
+            self.file_label_var.set(f"File: {filename}")
 
-        # 1) Read image with pds
-        image_data = pds.read_image(header_file_path=lbl_path, image_file_path=img_path)
-        self.current_image_data = image_data
-        self.original_height, self.original_width = image_data.shape
+            # Read image with pds
+            image_data = pds.read_image(header_file_path=lbl_path, image_file_path=img_path)
+            self.current_image_data = image_data
+            self.clean_image_data = None  # No clean reference for PDS images
+            
+        elif file_type == 'npz':
+            # Handle NPZ files (clean-noisy pairs)
+            npz_path = file_pair[0]
+            filename = os.path.basename(npz_path)
+            self.file_label_var.set(f"File: {filename}")
+            
+            # Read clean and noisy images from NPZ
+            clean_image, noisy_image = pds.read_npz_pair(npz_path)
+            
+            if clean_image is None or noisy_image is None:
+                print(f"Error loading NPZ file: {npz_path}")
+                return
+                
+            # Store the noisy image as current image for analysis
+            self.current_image_data = noisy_image
+            self.clean_image_data = clean_image
+            
+        else:
+            print(f"Unknown file type: {file_type}")
+            return
+            
+        self.original_height, self.original_width = self.current_image_data.shape
 
-        # 2) Contrast stretch using the utility function for display
-        disp_uint8 = create_display_image(image_data, method='percentile')
+        # Contrast stretch using the utility function for display
+        disp_uint8 = create_display_image(self.current_image_data, method='percentile')
 
         # Crop only for display (preserve full original image in memory)
         display_data = disp_uint8 # Already uint8
@@ -278,24 +350,34 @@ class PDSImageViewer(tk.Tk):
             elif self.zoom_state == "Q4":
                 display_data = display_data[half_h:, half_w:]
 
-        # 3) Make a 512×512 PIL image
+        # Make a 512×512 PIL image
         pil_image = Image.fromarray(display_data, mode='L')
         pil_image = pil_image.resize((512, 512), Image.BILINEAR)
 
-        # 4) Convert to PhotoImage
+        # Convert to PhotoImage
         self.tk_image = ImageTk.PhotoImage(pil_image)
 
-        # 5) Clear any previous rectangle
+        # Clear any previous rectangle
         if self.region_rect_id:
             self.image_canvas.delete(self.region_rect_id)
             self.region_rect_id = None
 
-        # 6) Display the new image on canvas
+        # Display the new image on canvas
         self.image_canvas.config(width=512, height=512)
         self.image_canvas.create_image(0, 0, anchor=tk.NW, image=self.tk_image)
 
         # Clear any old noise histogram
         self.clear_noise_histogram()
+        
+        # If this is an NPZ file, show an indicator that we have clean reference
+        if self.clean_image_data is not None:
+            self.image_canvas.create_text(
+                10, 10, 
+                text="Clean Reference Available", 
+                anchor=tk.NW, 
+                fill="green",
+                font=("Arial", 10, "bold")
+            )
 
     # ========================== GLOBAL HISTOGRAM ==========================
     def show_histogram(self):
@@ -667,10 +749,11 @@ class PDSImageViewer(tk.Tk):
         print(f"Patch logged to {LOGS_CSV_PATH}")
     
     def open_denoise_window(self):
-        """Open a separate window for testing denoising algorithms."""
-        if self.current_image_data is None:
-            return
-        DenoiseWindow(self, image_data=self.current_image_data)
+        """Open the denoise window with the current image."""
+        if self.current_image_data is not None:
+            # Pass the clean reference image if available (for NPZ files)
+            denoise_win = DenoiseWindow(self, image_data=self.current_image_data, clean_image_data=self.clean_image_data)
+            denoise_win.grab_set()  # Make it modal
         
 def main():
     viewer = PDSImageViewer()

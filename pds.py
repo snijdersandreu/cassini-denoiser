@@ -187,6 +187,49 @@ def save_image(image_data, new_image_file_path, original_image_file_path, header
             new_file.write(image_data[i, :].tobytes())
 
 
+# Add a new function to read clean-noisy image pairs from NPZ files
+def read_npz_pair(npz_file_path):
+    """
+    Read clean and noisy image pairs from an NPZ file.
+    
+    Parameters:
+        npz_file_path (str): Path to the NPZ file containing 'clean' and 'noisy' arrays
+        
+    Returns:
+        tuple: (clean_image, noisy_image) as numpy arrays
+    """
+    try:
+        # Load the NPZ file
+        data = np.load(npz_file_path)
+        
+        # Extract clean and noisy image data
+        clean_image = data['clean']
+        noisy_image = data['noisy']
+        
+        return clean_image, noisy_image
+    except Exception as e:
+        print(f"Error reading NPZ file {npz_file_path}: {e}")
+        return None, None
+
+
+# Determine the file type (PDS or NPZ)
+def get_file_type(file_path):
+    """
+    Determine if a file is a PDS (LBL/IMG) or NPZ file.
+    
+    Parameters:
+        file_path (str): Path to the file
+        
+    Returns:
+        str: 'pds' for LBL/IMG files, 'npz' for NPZ files, or None if unknown
+    """
+    if file_path.lower().endswith('.npz'):
+        return 'npz'
+    elif file_path.lower().endswith('.lbl') or file_path.lower().endswith('.img'):
+        return 'pds'
+    return None
+
+
 # Plot a PDS image
 def plot_image(image_data, plot_file_path=None, title_str=None, show=True):
     """
