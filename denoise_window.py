@@ -344,6 +344,32 @@ class DenoiseWindow(tk.Toplevel):
         snr_psd_label.pack(side='left', padx=(0, 10))
         vol_label = ttk.Label(metrics_frame, text="VoL: Calc...", font=('Helvetica', 9))
         vol_label.pack(side='left', padx=(0, 10))
+        
+        # Create a separate frame for the ground truth metrics if available
+        gt_metrics_frame = None
+        gt_snr_label = None
+        gt_rmse_label = None
+        gt_psnr_label = None
+        
+        # Only show ground truth metrics for denoised images (not original or clean reference)
+        if self.clean_image_data is not None and title != "Clean Reference" and title != "Original Image":
+            gt_metrics_frame = ttk.LabelFrame(info_frame, text="Ground Truth Metrics")
+            gt_metrics_frame.pack(fill='x', pady=(5, 5))
+            
+            # Add labels for ground truth metrics
+            gt_snr_label = ttk.Label(gt_metrics_frame, text="SNR: Calc...", font=('Helvetica', 9))
+            gt_snr_label.pack(side='left', padx=(5, 10))
+            
+            gt_psnr_label = ttk.Label(gt_metrics_frame, text="PSNR: Calc...", font=('Helvetica', 9)) 
+            gt_psnr_label.pack(side='left', padx=(0, 10))
+            
+            gt_rmse_label = ttk.Label(gt_metrics_frame, text="RMSE: Calc...", font=('Helvetica', 9))
+            gt_rmse_label.pack(side='left', padx=(0, 10))
+        else:
+            # Create dummy labels even if not displayed, to maintain widget structure
+            gt_snr_label = ttk.Label(metrics_frame, text="")
+            gt_psnr_label = ttk.Label(metrics_frame, text="")
+            gt_rmse_label = ttk.Label(metrics_frame, text="")
 
         hist_widget = self.create_histogram(info_frame, image_data if image_data is not None else np.zeros((1,1)), title="Value Distribution")
         hist_widget.pack(fill='x', expand=True)
@@ -380,7 +406,9 @@ class DenoiseWindow(tk.Toplevel):
                 'original_data': original_data, 'rect_id': None,
                 'hist_widget': hist_widget,
                 'psd_fig': psd_fig, 'psd_ax': psd_ax, 'psd_canvas': psd_canvas,
-                'vol_label': vol_label, 'snr_psd_label': snr_psd_label
+                'vol_label': vol_label, 'snr_psd_label': snr_psd_label,
+                'gt_snr_label': gt_snr_label, 'gt_rmse_label': gt_rmse_label, 'gt_psnr_label': gt_psnr_label,
+                'gt_metrics_frame': gt_metrics_frame
             }
             self.result_widgets.append(widget_info)
             return
@@ -405,7 +433,9 @@ class DenoiseWindow(tk.Toplevel):
             'original_data': original_data, 'rect_id': None,
             'hist_widget': hist_widget,
             'psd_fig': psd_fig, 'psd_ax': psd_ax, 'psd_canvas': psd_canvas,
-            'vol_label': vol_label, 'snr_psd_label': snr_psd_label
+            'vol_label': vol_label, 'snr_psd_label': snr_psd_label,
+            'gt_snr_label': gt_snr_label, 'gt_rmse_label': gt_rmse_label, 'gt_psnr_label': gt_psnr_label,
+            'gt_metrics_frame': gt_metrics_frame
         }
         self.result_widgets.append(widget_info)
 
@@ -413,9 +443,6 @@ class DenoiseWindow(tk.Toplevel):
         canvas.bind("<Button-1>", self.on_mouse_down)
         canvas.bind("<B1-Motion>", self.on_mouse_drag)
         canvas.bind("<ButtonRelease-1>", self.on_mouse_up)
-
-        # Calculate and display initial (global) PSD - this will be done by update_all_metrics call in apply_denoise
-        # self.update_psd_display(widget_info) # Removed direct call here
 
     def apply_denoise(self):
         """Apply selected denoising algorithms and display results horizontally"""
@@ -897,6 +924,10 @@ class DenoiseWindow(tk.Toplevel):
         hist_container = hist_widget.master # Assuming hist is always present
         vol_label = widget_info['vol_label']
         snr_psd_label = widget_info['snr_psd_label']
+        gt_snr_label = widget_info['gt_snr_label']
+        gt_rmse_label = widget_info['gt_rmse_label']
+        gt_psnr_label = widget_info['gt_psnr_label']
+        gt_metrics_frame = widget_info.get('gt_metrics_frame')
 
         if image_data is None:
             psd_ax.clear()
@@ -909,6 +940,12 @@ class DenoiseWindow(tk.Toplevel):
             # Update metric labels for no data
             vol_label.config(text="VoL: N/A")
             snr_psd_label.config(text="SNR (PSD): N/A")
+            if hasattr(gt_snr_label, 'winfo_ismapped') and gt_snr_label.winfo_ismapped():
+                gt_snr_label.config(text="SNR: N/A")
+            if hasattr(gt_rmse_label, 'winfo_ismapped') and gt_rmse_label.winfo_ismapped():
+                gt_rmse_label.config(text="RMSE: N/A")
+            if hasattr(gt_psnr_label, 'winfo_ismapped') and gt_psnr_label.winfo_ismapped():
+                gt_psnr_label.config(text="PSNR: N/A")
             return
 
         # Determine the data slice based on current selection
@@ -980,6 +1017,59 @@ class DenoiseWindow(tk.Toplevel):
         except Exception as e:
             print(f"Error calculating PSD SNR for {title}{region_label_psd}: {e}")
             snr_psd_label.config(text="SNR (PSD): Error")
+            
+        # Calculate ground truth metrics if clean image is available and this is a denoised result
+        if self.clean_image_data is not None and title != "Clean Reference" and title != "Original Image" and gt_metrics_frame:
+            try:
+                # Get the clean image slice using the same coordinates
+                if data_coords:
+                    dx0, dy0, dx1, dy1 = data_coords
+                    # Ensure the clean image has the same shape as the current image data
+                    if self.clean_image_data.shape == image_data.shape:
+                        clean_slice = self.clean_image_data[dy0:dy1, dx0:dx1]
+                    else:
+                        # If shapes don't match, can't do region-specific comparison
+                        clean_slice = self.clean_image_data
+                        print(f"Warning: Clean image shape ({self.clean_image_data.shape}) doesn't match denoised image shape ({image_data.shape})")
+                else:
+                    clean_slice = self.clean_image_data
+                
+                # Calculate ground truth metrics
+                gt_metrics = noise_analysis.calculate_snr_with_ground_truth(data_slice, clean_slice)
+                
+                # Update SNR label
+                if gt_metrics['snr_db'] is not None and not np.isnan(gt_metrics['snr_db']):
+                    if np.isinf(gt_metrics['snr_db']):
+                        gt_snr_label.config(text=f"SNR: \u221E dB")  # Unicode infinity symbol
+                    else:
+                        gt_snr_label.config(text=f"SNR: {gt_metrics['snr_db']:.2f} dB")
+                else:
+                    gt_snr_label.config(text="SNR: N/A")
+                
+                # Update PSNR label
+                if gt_metrics['psnr'] is not None and not np.isnan(gt_metrics['psnr']):
+                    if np.isinf(gt_metrics['psnr']):
+                        gt_psnr_label.config(text=f"PSNR: \u221E dB")  # Unicode infinity symbol
+                    else:
+                        gt_psnr_label.config(text=f"PSNR: {gt_metrics['psnr']:.2f} dB")
+                else:
+                    gt_psnr_label.config(text="PSNR: N/A")
+                
+                # Update RMSE label
+                if gt_metrics['rmse'] is not None and not np.isnan(gt_metrics['rmse']):
+                    # Format RMSE based on magnitude
+                    if gt_metrics['rmse'] < 0.01:
+                        gt_rmse_label.config(text=f"RMSE: {gt_metrics['rmse']:.2e}")
+                    else:
+                        gt_rmse_label.config(text=f"RMSE: {gt_metrics['rmse']:.4f}")
+                else:
+                    gt_rmse_label.config(text="RMSE: N/A")
+                
+            except Exception as e:
+                print(f"Error calculating ground truth metrics for {title}{region_label_psd}: {e}")
+                gt_snr_label.config(text="SNR: Error")
+                gt_psnr_label.config(text="PSNR: Error")
+                gt_rmse_label.config(text="RMSE: Error")
 
         # Update histogram for the selected region if selection exists
         hist_title = f"Value Distribution{region_label_psd}"
