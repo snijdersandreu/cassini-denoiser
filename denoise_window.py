@@ -9,6 +9,7 @@ import noise_analysis
 from denoising_algorithms import starlet
 from denoising_algorithms import bm3d
 from denoising_algorithms import unet_self2self
+from denoising_algorithms import wiener as custom_wiener
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.pyplot as plt
@@ -302,9 +303,14 @@ class DenoiseWindow(tk.Toplevel):
         result_container.pack(side='left', padx=10)
 
         # Add title
+        display_title = title
+        if image_data is not None:
+            h, w = image_data.shape[:2] # Get height and width
+            display_title = f"{title} ({h}x{w} px)"
+
         ttk.Label(
             result_container,
-            text=title,
+            text=display_title,
             font=('Helvetica', 12, 'bold')
         ).pack(pady=(0, 5))
 
@@ -342,8 +348,6 @@ class DenoiseWindow(tk.Toplevel):
         metrics_frame.pack(fill='x', pady=(5, 0))
         snr_psd_label = ttk.Label(metrics_frame, text="SNR (PSD): Calc...", font=('Helvetica', 9))
         snr_psd_label.pack(side='left', padx=(0, 10))
-        vol_label = ttk.Label(metrics_frame, text="VoL: Calc...", font=('Helvetica', 9))
-        vol_label.pack(side='left', padx=(0, 10))
         
         # Create a separate frame for the ground truth metrics if available
         gt_metrics_frame = None
@@ -351,8 +355,9 @@ class DenoiseWindow(tk.Toplevel):
         gt_rmse_label = None
         gt_psnr_label = None
         
-        # Only show ground truth metrics for denoised images (not original or clean reference)
-        if self.clean_image_data is not None and title != "Clean Reference" and title != "Original Image":
+        # Show ground truth metrics for any image panel if clean_image_data is available,
+        # except for the "Clean Reference" panel itself.
+        if self.clean_image_data is not None and title != "Clean Reference":
             gt_metrics_frame = ttk.LabelFrame(info_frame, text="Ground Truth Metrics")
             gt_metrics_frame.pack(fill='x', pady=(5, 5))
             
@@ -366,10 +371,12 @@ class DenoiseWindow(tk.Toplevel):
             gt_rmse_label = ttk.Label(gt_metrics_frame, text="RMSE: Calc...", font=('Helvetica', 9))
             gt_rmse_label.pack(side='left', padx=(0, 10))
         else:
-            # Create dummy labels even if not displayed, to maintain widget structure
-            gt_snr_label = ttk.Label(metrics_frame, text="")
+            # Create dummy labels if GT metrics are not applicable, to maintain widget_info structure
+            # These will be parented to metrics_frame and likely have empty text from update_psd_display
+            gt_snr_label = ttk.Label(metrics_frame, text="") 
             gt_psnr_label = ttk.Label(metrics_frame, text="")
             gt_rmse_label = ttk.Label(metrics_frame, text="")
+            # gt_metrics_frame remains None
 
         hist_widget = self.create_histogram(info_frame, image_data if image_data is not None else np.zeros((1,1)), title="Value Distribution")
         hist_widget.pack(fill='x', expand=True)
@@ -387,7 +394,7 @@ class DenoiseWindow(tk.Toplevel):
         save_button.pack(side='left', padx=3)
 
         # Add "Analyze Residuals" button for denoised images
-        if title != "Original Image" and image_data is not None:
+        if title != self.noisy_image_display_title and title != "Clean Reference" and image_data is not None:
             analyze_residuals_button = ttk.Button(
                 button_frame,
                 text="Analyze Residuals",
@@ -406,7 +413,7 @@ class DenoiseWindow(tk.Toplevel):
                 'original_data': original_data, 'rect_id': None,
                 'hist_widget': hist_widget,
                 'psd_fig': psd_fig, 'psd_ax': psd_ax, 'psd_canvas': psd_canvas,
-                'vol_label': vol_label, 'snr_psd_label': snr_psd_label,
+                'snr_psd_label': snr_psd_label,
                 'gt_snr_label': gt_snr_label, 'gt_rmse_label': gt_rmse_label, 'gt_psnr_label': gt_psnr_label,
                 'gt_metrics_frame': gt_metrics_frame
             }
@@ -433,7 +440,7 @@ class DenoiseWindow(tk.Toplevel):
             'original_data': original_data, 'rect_id': None,
             'hist_widget': hist_widget,
             'psd_fig': psd_fig, 'psd_ax': psd_ax, 'psd_canvas': psd_canvas,
-            'vol_label': vol_label, 'snr_psd_label': snr_psd_label,
+            'snr_psd_label': snr_psd_label,
             'gt_snr_label': gt_snr_label, 'gt_rmse_label': gt_rmse_label, 'gt_psnr_label': gt_psnr_label,
             'gt_metrics_frame': gt_metrics_frame
         }
@@ -455,6 +462,9 @@ class DenoiseWindow(tk.Toplevel):
 
         self.selection_coords = None
         self.select_start_pos = None
+
+        # Determine the title for the noisy image
+        self.noisy_image_display_title = "Noisy Image" if self.clean_image_data is not None else "Original Image"
 
         # Prepare results_frame inside the scrollable_canvas
         if self.results_frame and self.results_frame.winfo_exists():
@@ -511,19 +521,26 @@ class DenoiseWindow(tk.Toplevel):
         # but if rescaling disabled, display original_arr
         display_data_original = arr if self.rescale_var.get() else original_arr
         
+        if self.rescale_var.get():
+            print(f"Using rescaled {self.noisy_image_display_title}: [{np.min(display_data_original):.4f}, {np.max(display_data_original):.4f}]")
+        else:
+            print(f"Using original {self.noisy_image_display_title}: [{np.min(display_data_original):.4f}, {np.max(display_data_original):.4f}]")
+        
         # If clean reference image is available, display it first
         if self.clean_image_data is not None:
             # If rescaling is enabled, also rescale the clean reference
             if self.rescale_var.get():
                 # Use same scaling parameters as for the noisy image
                 clean_arr = (self.clean_image_data - self.p1) / self.scale_factor
+                print(f"Rescaled clean reference to [0,1] range: [{np.min(clean_arr):.4f}, {np.max(clean_arr):.4f}]")
                 self.show_result("Clean Reference", clean_arr, original_data=display_data_original)
             else:
+                print(f"Using clean reference directly: [{np.min(self.clean_image_data):.4f}, {np.max(self.clean_image_data):.4f}]")
                 self.show_result("Clean Reference", self.clean_image_data, original_data=display_data_original)
 
         # Show original next (either unscaled or rescaled depending on checkbox)
         # Pass the appropriate original data reference (needed for comparisons later)
-        self.show_result("Original Image", display_data_original, original_data=display_data_original)
+        self.show_result(self.noisy_image_display_title, display_data_original, original_data=display_data_original)
 
         # Apply selected algorithms and show results
         if self.wiener_var.get():
@@ -540,19 +557,20 @@ class DenoiseWindow(tk.Toplevel):
                 # Adjust noise STD based on the percentile scaling factor used (p99-p1 or 1.0)
                 adjusted_noise_std = noise_std / self.scale_factor if self.rescale_var.get() else noise_std
                 
-                # Apply Wiener filter with specified parameters to the *potentially scaled* data 'arr'
-                den_scaled = wiener(arr, (kernel_size, kernel_size), adjusted_noise_std**2)
+                # Use our custom implementation from wiener module
+                den_scaled = custom_wiener.wiener_filter(arr, kernel_size, adjusted_noise_std)
                 
-                # IMPORTANT: If rescaling is enabled, we DO NOT rescale back for SNR calculation
-                # Instead, we keep the den_scaled value to compare SNR in the [0,1] domain
-                # We'll only rescale back for display if needed
-                if self.rescale_var.get() and self.scale_factor > 1e-8:
-                    # Keep den_scaled for SNR calculation
-                    # Only rescale for final display
-                    den_display = den_scaled * self.scale_factor + self.p1
-                else:
+                # If rescaling is enabled, maintain the scaling for SNR calculation
+                # The calculate_ground_truth_metrics method will handle scaling both images consistently
+                if self.rescale_var.get():
+                    # If we rescaled the input to [0,1], keep the output in [0,1]
                     den_display = den_scaled
-                    
+                    print(f"Keeping Wiener output in [0,1] range for consistent metrics: [{np.min(den_scaled):.4f}, {np.max(den_scaled):.4f}]")
+                else:
+                    # No rescaling was applied, use as is
+                    den_display = den_scaled
+                    print(f"Using Wiener output directly: [{np.min(den_scaled):.4f}, {np.max(den_scaled):.4f}]")
+                
                 # Pass appropriate values for SNR calculation and display
                 self.show_result("Wiener Filter", 
                                  # For SNR calculation and display
@@ -579,11 +597,15 @@ class DenoiseWindow(tk.Toplevel):
                 # Sigma is estimated internally by default if not provided
                 den_scaled = starlet.apply_starlet_denoising(arr, n_scales=n_scales, k=k)
                 
-                # Similar approach as Wiener filter - don't rescale for SNR calculation if rescaling enabled
-                if self.rescale_var.get() and self.scale_factor > 1e-8:
-                    den_display = den_scaled * self.scale_factor + self.p1
-                else:
+                # Maintain consistent scaling approach
+                if self.rescale_var.get():
+                    # Keep in [0,1] range for consistent metrics
                     den_display = den_scaled
+                    print(f"Keeping Starlet output in [0,1] range: [{np.min(den_scaled):.4f}, {np.max(den_scaled):.4f}]")
+                else:
+                    # No rescaling applied, use as is
+                    den_display = den_scaled
+                    print(f"Using Starlet output directly: [{np.min(den_scaled):.4f}, {np.max(den_scaled):.4f}]")
                     
                 self.show_result("Starlet Transform", den_display, display_data_original)
             except Exception as e:
@@ -596,11 +618,15 @@ class DenoiseWindow(tk.Toplevel):
                 # Apply BM3D to the *potentially scaled* data 'arr'
                 den_scaled = bm3d.bm3d_denoise(arr) 
                 
-                # Similar approach
-                if self.rescale_var.get() and self.scale_factor > 1e-8:
-                    den_display = den_scaled * self.scale_factor + self.p1
-                else:
+                # Maintain consistent scaling approach
+                if self.rescale_var.get():
+                    # Keep in [0,1] range for consistent metrics
                     den_display = den_scaled
+                    print(f"Keeping BM3D output in [0,1] range: [{np.min(den_scaled):.4f}, {np.max(den_scaled):.4f}]")
+                else:
+                    # No rescaling applied, use as is
+                    den_display = den_scaled
+                    print(f"Using BM3D output directly: [{np.min(den_scaled):.4f}, {np.max(den_scaled):.4f}]")
                     
                 self.show_result("BM3D", den_display, display_data_original)
             except Exception as e:
@@ -613,11 +639,15 @@ class DenoiseWindow(tk.Toplevel):
                 # Apply UNET to the *potentially scaled* data 'arr'
                 den_scaled = unet_self2self.unet_self2self_denoise(arr) 
                 
-                # Similar approach
-                if self.rescale_var.get() and self.scale_factor > 1e-8:
-                    den_display = den_scaled * self.scale_factor + self.p1
-                else:
+                # Maintain consistent scaling approach
+                if self.rescale_var.get():
+                    # Keep in [0,1] range for consistent metrics
                     den_display = den_scaled
+                    print(f"Keeping UNET output in [0,1] range: [{np.min(den_scaled):.4f}, {np.max(den_scaled):.4f}]")
+                else:
+                    # No rescaling applied, use as is
+                    den_display = den_scaled
+                    print(f"Using UNET output directly: [{np.min(den_scaled):.4f}, {np.max(den_scaled):.4f}]")
                     
                 self.show_result("UNET-Self2Self", den_display, display_data_original)
             except Exception as e:
@@ -883,38 +913,43 @@ class DenoiseWindow(tk.Toplevel):
 
     def update_all_metrics(self):
         """Recalculate and update metrics display (PSD plots) for all result widgets."""
-        # Get the original data's slice based on current selection (if any)
-        original_widget = next((w for w in self.result_widgets if w['title'] == "Original Image"), None)
+        # Determine the title of the image to use as the PSD reference
+        if self.clean_image_data is not None:
+            psd_reference_title = "Clean Reference"
+        else:
+            psd_reference_title = self.noisy_image_display_title # This is "Original Image" or "Noisy Image"
 
-        original_psd = None
-        original_freqs = None
+        psd_reference_widget = next((w for w in self.result_widgets if w['title'] == psd_reference_title), None)
+
+        reference_freqs = None
+        reference_psd = None
         region_label_psd = " (Global)"
 
-        if not original_widget or original_widget['data'] is None:
-            print("Original image data not found for PSD calculation.")
+        if not psd_reference_widget or psd_reference_widget['data'] is None:
+            print(f"{psd_reference_title} data not found for PSD reference calculation.")
         else:
-            original_full_data = original_widget['data']
-            data_coords = self.map_preview_coords_to_data_coords(self.selection_coords, original_full_data.shape)
+            reference_full_data = psd_reference_widget['data']
+            data_coords = self.map_preview_coords_to_data_coords(self.selection_coords, reference_full_data.shape)
 
             if data_coords:
                 dx0, dy0, dx1, dy1 = data_coords
-                original_data_slice = original_full_data[dy0:dy1, dx0:dx1]
+                reference_data_slice = reference_full_data[dy0:dy1, dx0:dx1]
                 region_label_psd = f" (Region {dx0}:{dx1},{dy0}:{dy1})"
             else: # No selection, use global
-                original_data_slice = original_full_data
+                reference_data_slice = reference_full_data
 
-            # Calculate PSD for the original slice (regional or global)
+            # Calculate PSD for the reference slice (regional or global)
             try:
-                original_freqs, original_psd = self.calculate_radial_psd(original_data_slice)
+                reference_freqs, reference_psd = self.calculate_radial_psd(reference_data_slice)
             except Exception as e:
-                print(f"Error calculating PSD for original slice: {e}")
-                original_freqs, original_psd = None, None
+                print(f"Error calculating PSD for {psd_reference_title} slice: {e}")
+                reference_freqs, reference_psd = None, None
 
         # Now update each widget's plot
         for widget_info in self.result_widgets:
-            self.update_psd_display(widget_info, original_freqs, original_psd, region_label_psd)
+            self.update_psd_display(widget_info, reference_freqs, reference_psd, psd_reference_title, region_label_psd)
 
-    def update_psd_display(self, widget_info, original_freqs, original_psd, region_label_psd):
+    def update_psd_display(self, widget_info, reference_freqs, reference_psd, psd_reference_title, region_label_psd):
         """Calculate and display PSD plot for a specific widget, using the current selection."""
         image_data = widget_info['data']
         psd_ax = widget_info['psd_ax']
@@ -922,7 +957,6 @@ class DenoiseWindow(tk.Toplevel):
         title = widget_info['title']
         hist_widget = widget_info['hist_widget']
         hist_container = hist_widget.master # Assuming hist is always present
-        vol_label = widget_info['vol_label']
         snr_psd_label = widget_info['snr_psd_label']
         gt_snr_label = widget_info['gt_snr_label']
         gt_rmse_label = widget_info['gt_rmse_label']
@@ -938,7 +972,6 @@ class DenoiseWindow(tk.Toplevel):
             except tk.TclError: pass # Handle if canvas is destroyed
 
             # Update metric labels for no data
-            vol_label.config(text="VoL: N/A")
             snr_psd_label.config(text="SNR (PSD): N/A")
             if hasattr(gt_snr_label, 'winfo_ismapped') and gt_snr_label.winfo_ismapped():
                 gt_snr_label.config(text="SNR: N/A")
@@ -973,9 +1006,9 @@ class DenoiseWindow(tk.Toplevel):
             psd_ax.plot(current_freqs, current_psd, label=f'{title} PSD', color='blue', linewidth=1)
             plot_success = True
 
-        if original_freqs is not None and original_psd is not None:
-             # Plot original PSD for comparison (log scale for power)
-             psd_ax.plot(original_freqs, original_psd, label='Original PSD', color='black', linestyle='--', linewidth=0.8, alpha=0.7)
+        if reference_freqs is not None and reference_psd is not None:
+             # Plot reference PSD for comparison (log scale for power)
+             psd_ax.plot(reference_freqs, reference_psd, label=f'{psd_reference_title} PSD', color='black', linestyle='--', linewidth=0.8, alpha=0.7)
              plot_success = True
 
 
@@ -1002,13 +1035,6 @@ class DenoiseWindow(tk.Toplevel):
 
         # --- Calculate and Display Single Value Metrics ---
         try:
-            vol_value = self.calculate_vol(data_slice)
-            vol_label.config(text=f"VoL: {vol_value:.3g}")
-        except Exception as e:
-            print(f"Error calculating VoL for {title}{region_label_psd}: {e}")
-            vol_label.config(text="VoL: Error")
-
-        try:
             snr_metrics = noise_analysis.estimate_snr_psd(data_slice)
             if snr_metrics and snr_metrics['snr_db'] is not None and not np.isnan(snr_metrics['snr_db']):
                 snr_psd_label.config(text=f"SNR (PSD): {snr_metrics['snr_db']:.2f} dB")
@@ -1019,7 +1045,7 @@ class DenoiseWindow(tk.Toplevel):
             snr_psd_label.config(text="SNR (PSD): Error")
             
         # Calculate ground truth metrics if clean image is available and this is a denoised result
-        if self.clean_image_data is not None and title != "Clean Reference" and title != "Original Image" and gt_metrics_frame:
+        if self.clean_image_data is not None and gt_metrics_frame:
             try:
                 # Get the clean image slice using the same coordinates
                 if data_coords:
@@ -1030,12 +1056,23 @@ class DenoiseWindow(tk.Toplevel):
                     else:
                         # If shapes don't match, can't do region-specific comparison
                         clean_slice = self.clean_image_data
-                        print(f"Warning: Clean image shape ({self.clean_image_data.shape}) doesn't match denoised image shape ({image_data.shape})")
+                        print(f"Warning: Clean image shape ({self.clean_image_data.shape}) doesn't match current image shape ({image_data.shape})")
                 else:
                     clean_slice = self.clean_image_data
                 
-                # Calculate ground truth metrics
-                gt_metrics = noise_analysis.calculate_snr_with_ground_truth(data_slice, clean_slice)
+                # DEBUG: Print statistics about the slices before SNR calculation
+                print(f"\n=== DEBUG FOR {title} ===")
+                print(f"Data slice shape: {data_slice.shape}, min: {np.min(data_slice):.6f}, max: {np.max(data_slice):.6f}")
+                print(f"Clean slice shape: {clean_slice.shape}, min: {np.min(clean_slice):.6f}, max: {np.max(clean_slice):.6f}")
+                
+                # Use our custom calculator instead of noise_analysis.calculate_snr_with_ground_truth
+                gt_metrics = self.calculate_ground_truth_metrics(data_slice, clean_slice)
+                
+                # DEBUG: Print the calculated metrics
+                print(f"Signal power: {gt_metrics.get('signal_power', 'N/A'):.6e}")
+                print(f"Noise power: {gt_metrics.get('noise_power', 'N/A'):.6e}")
+                print(f"Calculated metrics - SNR: {gt_metrics['snr_db']}, PSNR: {gt_metrics['psnr']}, RMSE: {gt_metrics['rmse']}")
+                print("=== END DEBUG ===\n")
                 
                 # Update SNR label
                 if gt_metrics['snr_db'] is not None and not np.isnan(gt_metrics['snr_db']):
@@ -1070,7 +1107,7 @@ class DenoiseWindow(tk.Toplevel):
                 gt_snr_label.config(text="SNR: Error")
                 gt_psnr_label.config(text="PSNR: Error")
                 gt_rmse_label.config(text="RMSE: Error")
-
+            
         # Update histogram for the selected region if selection exists
         hist_title = f"Value Distribution{region_label_psd}"
         # Remove old histogram and create new one for the slice
@@ -1227,211 +1264,697 @@ class DenoiseWindow(tk.Toplevel):
 
     # =================== Single Value Metric Calculations ==================
 
-    def calculate_vol(self, image_patch):
-        """Calculate Variance of Laplacian for sharpness estimation."""
-        if image_patch is None or image_patch.ndim != 2 or image_patch.size == 0:
-            return np.nan
-        # Calculate Laplacian (scipy.ndimage.laplace uses a default kernel)
-        lap = laplace(image_patch)
-        return np.var(lap)
+    def calculate_ground_truth_metrics(self, input_image, clean_image):
+        """
+        Calculate SNR and PSNR metrics between input image and clean reference.
+        Ensures both images are on the same scale before calculation.
+        
+        This is a direct implementation similar to analyze_snr.py.
+        
+        Parameters:
+            input_image (ndarray): Input image data (noisy or denoised)
+            clean_image (ndarray): Clean reference image
+            
+        Returns:
+            dict: Containing SNR, PSNR, RMSE and other metrics
+        """
+        # Check for rescale checkbox state (important for consistent scaling)
+        needs_rescaling = self.rescale_var.get()
+        
+        # Get the scale parameters from the main denoise window
+        if hasattr(self, 'p1') and hasattr(self, 'scale_factor'):
+            p1 = self.p1
+            scale_factor = self.scale_factor
+        else:
+            # No scaling info available, assume no scaling needed
+            p1 = 0.0
+            scale_factor = 1.0
+            needs_rescaling = False
+            
+        # Get image ranges
+        input_min, input_max = np.min(input_image), np.max(input_image) 
+        clean_min, clean_max = np.min(clean_image), np.max(clean_image)
+        
+        print(f"Original ranges - Input: [{input_min:.4f}, {input_max:.4f}], Clean: [{clean_min:.4f}, {clean_max:.4f}]")
+        print(f"Scaling info - p1: {p1:.4f}, scale_factor: {scale_factor:.4f}, needs_rescaling: {needs_rescaling}")
+        
+        # Determine if input is already in the [0,1] range
+        input_is_normalized = (input_max <= 1.1 and input_min >= -0.1)
+        clean_is_normalized = (clean_max <= 1.1 and clean_min >= -0.1)
+        
+        # Make working copies to avoid modifying originals
+        input_data = input_image.copy()
+        clean_data = clean_image.copy()
+        
+        # Cases:
+        # 1. If rescale option is enabled: scale both to [0,1] using the same params
+        # 2. If not, but one is normalized and other isn't: normalize the non-normalized one
+        # 3. If both are in same range (both normalized or both original): no scaling needed
+        
+        if needs_rescaling and scale_factor > 1e-8:
+            # Case 1: Rescale both consistently to [0,1] using same parameters
+            if not input_is_normalized:
+                input_data = (input_image - p1) / scale_factor
+                print(f"Rescaled input from [{input_min:.4f}, {input_max:.4f}] to [0,1] range")
+                
+            if not clean_is_normalized:  
+                clean_data = (clean_image - p1) / scale_factor
+                print(f"Rescaled clean from [{clean_min:.4f}, {clean_max:.4f}] to [0,1] range")
+                
+        elif input_is_normalized != clean_is_normalized:
+            # Case 2: One is normalized and other isn't
+            if input_is_normalized:
+                # Input is [0,1], scale clean to match
+                clean_range = clean_max - clean_min
+                if clean_range > 1e-8:
+                    clean_data = (clean_image - clean_min) / clean_range
+                    print(f"Matched scaling: Normalized clean to [0,1]")
+                else:
+                    clean_data = np.zeros_like(clean_image)
+                    print("Warning: Clean image has zero range")
+            else:
+                # Clean is [0,1], scale input to match
+                input_range = input_max - input_min
+                if input_range > 1e-8:
+                    input_data = (input_image - input_min) / input_range
+                    print(f"Matched scaling: Normalized input to [0,1]")
+                else:
+                    input_data = np.zeros_like(input_image)
+                    print("Warning: Input image has zero range")
+        else:
+            # Case 3: Both in same range (both normalized or both in original range)
+            print("Both images already in same range, no rescaling needed")
+            
+        # Extract noise as the difference between input and clean
+        noise = input_data - clean_data
+        
+        # Calculate signal power (from clean image)
+        signal_power = np.mean(clean_data ** 2)
+        
+        # Calculate noise power
+        noise_power = np.mean(noise ** 2)
+        
+        # Calculate SNR
+        if noise_power < 1e-10:  # Avoid division by zero
+            snr_linear = float('inf')
+            snr_db = float('inf')
+        else:
+            snr_linear = signal_power / noise_power
+            snr_db = 10 * np.log10(snr_linear)
+        
+        # Calculate RMSE
+        rmse = np.sqrt(noise_power)
+        
+        # Calculate PSNR
+        data_range = np.max(clean_data) - np.min(clean_data)
+        if rmse < 1e-10 or data_range < 1e-10:
+            psnr = float('inf')
+        else:
+            psnr = 20 * np.log10(data_range / rmse)
+            
+        # Return all metrics in a dictionary
+        return {
+            'mse': noise_power,
+            'rmse': rmse,
+            'psnr': psnr,
+            'snr_db': snr_db,
+            'snr_linear': snr_linear,
+            'signal_power': signal_power,
+            'noise_power': noise_power,
+            'noise_min': np.min(noise),
+            'noise_max': np.max(noise),
+            'noise_mean': np.mean(noise),
+            'noise_std': np.std(noise),
+            'scaled_clean': clean_data,  # The properly scaled clean image
+            'scaled_residual': noise  # The computed residual/noise after proper scaling
+        }
 
     # ==================== Residual Analysis =====================
     def open_residual_analysis_window(self, denoised_title_str, denoised_image_data_full):
+        """
+        Open a window to analyze the residuals between images.
+        
+        Cases:
+        1. Clean reference exists (NPZ files): show [denoised - clean] or [noisy - clean]
+        2. No clean reference (LBL/IMG pairs): show [original - denoised]
+        
+        Parameters:
+        -----------
+        denoised_title_str : str
+            Title of the denoised image method
+        denoised_image_data_full : ndarray
+            Full denoised image data array
+        """
         try:
-            original_widget_info = next((w for w in self.result_widgets if w['title'] == "Original Image"), None)
-            if not original_widget_info or original_widget_info['data'] is None:
-                tkinter.messagebox.showerror("Error", "Original image data not available for residual analysis.")
+            if denoised_image_data_full is None:
+                tkinter.messagebox.showwarning("Missing Data", "No denoised image data available for analysis.")
                 return
-            original_image_data_full = original_widget_info['data']
-
-            # Determine data slice based on current selection
+                
+            # Get current selection (if any)
+            selected_region = None
             if self.selection_coords:
-                data_coords_orig = self.map_preview_coords_to_data_coords(self.selection_coords, original_image_data_full.shape)
-                # Denoised image should have same dimensions as original *before* preview scaling
-                # The denoised_image_data_full is the full denoised image.
-                data_coords_denoised = self.map_preview_coords_to_data_coords(self.selection_coords, denoised_image_data_full.shape)
-
-
-                if not data_coords_orig or not data_coords_denoised:
-                    tkinter.messagebox.showerror("Error", "Invalid selection coordinates for residual analysis.")
+                data_coords = self.map_preview_coords_to_data_coords(self.selection_coords, denoised_image_data_full.shape)
+                if data_coords:
+                    dx0, dy0, dx1, dy1 = data_coords
+                    min_dim = 2  # Minimum dimension for analysis
+                    if (dx1 - dx0) >= min_dim and (dy1 - dy0) >= min_dim:
+                        selected_region = (dx0, dy0, dx1, dy1)
+            
+            # Get appropriate image data based on selection
+            if selected_region:
+                dx0, dy0, dx1, dy1 = selected_region
+                denoised_data = denoised_image_data_full[dy0:dy1, dx0:dx1]
+                region_label = f" (Region {dx0}-{dx1}, {dy0}-{dy1})"
+            else:
+                denoised_data = denoised_image_data_full
+                region_label = " (Full Image)"
+            
+            # === CASE 1: Clean reference image exists (NPZ files) ===
+            if self.clean_image_data is not None:
+                clean_image_full = self.clean_image_data
+                
+                # Get clean image data for the same region
+                if selected_region:
+                    dx0, dy0, dx1, dy1 = selected_region
+                    if dx1 <= clean_image_full.shape[1] and dy1 <= clean_image_full.shape[0]:
+                        clean_data = clean_image_full[dy0:dy1, dx0:dx1]
+                    else:
+                        # Handle mismatched shapes - fall back to full images
+                        tkinter.messagebox.showwarning("Shape Mismatch", "Selected region exceeds clean image dimensions. Using full images.")
+                        denoised_data = denoised_image_data_full
+                        clean_data = clean_image_full
+                        region_label = " (Full Image - Fallback)"
+                else:
+                    clean_data = clean_image_full
+                
+                # Ensure shapes match
+                if denoised_data.shape != clean_data.shape:
+                    tkinter.messagebox.showwarning("Shape Mismatch", 
+                                                  f"Denoised shape {denoised_data.shape} and clean shape {clean_data.shape} do not match. Using full images.")
+                    denoised_data = denoised_image_data_full
+                    clean_data = clean_image_full
+                    region_label = " (Full Image - Fallback)"
+                
+                try:
+                    # Get properly scaled data using our ground truth metrics calculator
+                    metrics = self.calculate_ground_truth_metrics(denoised_data, clean_data)
+                    
+                    # [denoised - clean] calculation with proper scaling
+                    residual_data = metrics['scaled_residual']
+                    
+                    # Ensure metrics dictionary has all required fields
+                    if 'scaled_residual' not in metrics or residual_data is None:
+                        raise ValueError("Failed to calculate residual data")
+                    
+                    # Ensure basic statistics are included
+                    residual_flat = residual_data.ravel()
+                    metrics['mean'] = metrics.get('mean', np.mean(residual_flat))
+                    metrics['std'] = metrics.get('std', np.std(residual_flat))
+                    metrics['min'] = metrics.get('min', np.min(residual_flat))
+                    metrics['max'] = metrics.get('max', np.max(residual_flat))
+                    
+                    # Create title with metrics
+                    snr_text = f"SNR: {metrics['snr_db']:.2f}dB" if 'snr_db' in metrics and not np.isinf(metrics.get('snr_db', 0)) else "SNR: ∞dB"
+                    psnr_text = f"PSNR: {metrics['psnr']:.2f}dB" if 'psnr' in metrics and not np.isinf(metrics.get('psnr', 0)) else "PSNR: ∞dB"
+                    window_title = f"{denoised_title_str} Residuals (vs Clean){region_label} - {snr_text}, {psnr_text}"
+                    
+                    # Also prepare the "original" noisy image residual against clean reference
+                    noisy_residual = None
+                    noisy_metrics = None
+                    
+                    if denoised_title_str != self.noisy_image_display_title:
+                        original_widget_info = next((w for w in self.result_widgets if w['title'] == self.noisy_image_display_title), None)
+                        if original_widget_info and original_widget_info['data'] is not None:
+                            original_full = original_widget_info['data']
+                            if selected_region:
+                                dx0, dy0, dx1, dy1 = selected_region
+                                if (dx1 <= original_full.shape[1] and dy1 <= original_full.shape[0]):
+                                    original_data = original_full[dy0:dy1, dx0:dx1]
+                                else:
+                                    original_data = original_full
+                            else:
+                                original_data = original_full
+                            
+                            if original_data.shape == clean_data.shape:
+                                # Calculate residual and metrics for noisy image vs clean
+                                try:
+                                    noisy_metrics = self.calculate_ground_truth_metrics(original_data, clean_data)
+                                    noisy_residual = noisy_metrics.get('scaled_residual')
+                                    
+                                    # Ensure basic statistics for noisy residual
+                                    if noisy_residual is not None:
+                                        noisy_flat = noisy_residual.ravel()
+                                        noisy_metrics['mean'] = noisy_metrics.get('mean', np.mean(noisy_flat))
+                                        noisy_metrics['std'] = noisy_metrics.get('std', np.std(noisy_flat))
+                                        noisy_metrics['min'] = noisy_metrics.get('min', np.min(noisy_flat))
+                                        noisy_metrics['max'] = noisy_metrics.get('max', np.max(noisy_flat))
+                                except Exception as e:
+                                    print(f"Error calculating noisy metrics: {e}")
+                                    noisy_residual = None
+                                    noisy_metrics = None
+                    
+                    # Launch residual analysis popup with both denoised and noisy residuals
+                    ResidualAnalysisPopup(self, 
+                                        main_residual=residual_data, 
+                                        metrics=metrics,
+                                        comparison_residual=noisy_residual,
+                                        comparison_metrics=noisy_metrics,
+                                        main_title=f"{denoised_title_str} - Clean",
+                                        comparison_title=f"{self.noisy_image_display_title} - Clean",
+                                        window_title=window_title,
+                                        region_label=region_label)
+                except Exception as e:
+                    tkinter.messagebox.showerror("Calculation Error", f"Error calculating metrics: {str(e)}")
+                    print(f"Error in clean reference metrics: {e}")
                     return
                 
-                dx0_o, dy0_o, dx1_o, dy1_o = data_coords_orig
-                dx0_d, dy0_d, dx1_d, dy1_d = data_coords_denoised
-
-                # Check if slice is too small
-                min_dim = 2 # Minimum dimension for estimate_noise
-                if (dx1_o - dx0_o) < min_dim or (dy1_o - dy0_o) < min_dim or \
-                   (dx1_d - dx0_d) < min_dim or (dy1_d - dy0_d) < min_dim:
-                    tkinter.messagebox.showwarning("Warning", f"Selected region is too small (min {min_dim}x{min_dim} required). Using full image for residual analysis.")
-                    current_orig_data = original_image_data_full
-                    current_denoised_data = denoised_image_data_full
-                    region_label = " (Full Image)"
-                else:
-                    current_orig_data = original_image_data_full[dy0_o:dy1_o, dx0_o:dx1_o]
-                    current_denoised_data = denoised_image_data_full[dy0_d:dy1_d, dx0_d:dx1_d]
-                    # Use original coords for label, assuming they are representative
-                    region_label = f" (Region {dx0_o}-{dx1_o}, {dy0_o}-{dy1_o})"
+            # === CASE 2: No clean reference (LBL/IMG pairs) ===
             else:
-                current_orig_data = original_image_data_full
-                current_denoised_data = denoised_image_data_full
-                region_label = " (Full Image)"
-
-            # Get residuals
-            try:
-                _, _, orig_residuals, _, _, _, _, _ = noise_analysis.estimate_noise(current_orig_data)
-            except Exception as e:
-                tkinter.messagebox.showerror("Error", f"Failed to estimate noise for original image slice: {e}")
-                return
-            
-            try:
-                _, _, denoised_residuals, _, _, _, _, _ = noise_analysis.estimate_noise(current_denoised_data)
-            except Exception as e:
-                tkinter.messagebox.showerror("Error", f"Failed to estimate noise for denoised image slice: {e}")
-                return
-
-            if orig_residuals is None or denoised_residuals is None:
-                tkinter.messagebox.showerror("Error", "Failed to obtain residuals for analysis (None returned).")
-                return
-
-            eliminated_residual_data = orig_residuals - denoised_residuals
-            
-            elim_flat = eliminated_residual_data.ravel()
-            if elim_flat.size == 0:
-                tkinter.messagebox.showerror("Error", "Eliminated residuals data is empty.")
-                return
-
-            mean = np.mean(elim_flat)
-            std = np.std(elim_flat)
-            std_for_kstest = std if std > 1e-12 else 1e-12 # Avoid division by zero
-            
-            skewness = skew(elim_flat, bias=False)
-            kurt = kurtosis(elim_flat, fisher=False) 
-            _, pval = kstest((elim_flat - mean) / std_for_kstest, 'norm')
-            
-            stats = {
-                'mean': mean, 'std': std, 
-                'skew': skewness, 'kurt': kurt, 'pval': pval,
-                'min': np.min(elim_flat), 'max': np.max(elim_flat) # For histogram range
-            }
-
-            ResidualAnalysisPopup(self, eliminated_residual_data, stats, 
-                                  title_prefix=f"{denoised_title_str}{region_label}")
-
+                # Get the original image data
+                original_widget_info = next((w for w in self.result_widgets if w['title'] == self.noisy_image_display_title), None)
+                if not original_widget_info or original_widget_info['data'] is None:
+                    tkinter.messagebox.showwarning("Missing Data", f"Original image data not available.")
+                    return
+                
+                original_full = original_widget_info['data']
+                
+                # Get original data for the same region
+                if selected_region:
+                    dx0, dy0, dx1, dy1 = selected_region
+                    if dx1 <= original_full.shape[1] and dy1 <= original_full.shape[0]:
+                        original_data = original_full[dy0:dy1, dx0:dx1]
+                    else:
+                        original_data = original_full
+                else:
+                    original_data = original_full
+                
+                # Ensure shapes match
+                if denoised_data.shape != original_data.shape:
+                    tkinter.messagebox.showwarning("Shape Mismatch", 
+                                                 f"Denoised shape {denoised_data.shape} and original shape {original_data.shape} do not match. Using full images.")
+                    denoised_data = denoised_image_data_full
+                    original_data = original_full
+                    region_label = " (Full Image - Fallback)"
+                
+                try:
+                    # Calculate [original - denoised]
+                    residual_data = original_data - denoised_data
+                    
+                    # Calculate statistics on the residual
+                    try:
+                        residual_flat = residual_data.ravel()
+                        metrics = {
+                            # Removed mean to avoid errors
+                            'std': np.std(residual_flat),
+                            'skew': skew(residual_flat, bias=False),
+                            'kurt': kurtosis(residual_flat, fisher=False),
+                            'min': np.min(residual_flat),
+                            'max': np.max(residual_flat)
+                        }
+                        
+                        # Kolmogorov-Smirnov test against normal distribution
+                        # Use 0 instead of mean for KS test
+                        std_for_kstest = metrics['std'] if metrics['std'] > 1e-12 else 1e-12  # Avoid division by zero
+                        _, metrics['pval'] = kstest((residual_flat) / std_for_kstest, 'norm')
+                        
+                        # Add empty placeholders for GT metrics to avoid key errors
+                        metrics['snr_db'] = None
+                        metrics['psnr'] = None
+                        metrics['rmse'] = None
+                        
+                        print(f"DEBUG: Successfully calculated metrics: {', '.join(metrics.keys())}")
+                    except Exception as metric_e:
+                        print(f"DEBUG: Error calculating metrics: {metric_e}")
+                        print(f"DEBUG: residual_data shape: {residual_data.shape}, type: {type(residual_data)}")
+                        print(f"DEBUG: residual_data min: {np.min(residual_data)}, max: {np.max(residual_data)}")
+                        print(f"DEBUG: Original data shape: {original_data.shape}, Denoised data shape: {denoised_data.shape}")
+                        # Create a basic metrics dict to prevent further errors
+                        residual_flat = residual_data.ravel()
+                        metrics = {
+                            'std': np.std(residual_flat),
+                            'skew': 0.0,
+                            'kurt': 0.0,
+                            'min': np.min(residual_flat),
+                            'max': np.max(residual_flat),
+                            'pval': 0.5,
+                            'snr_db': None,
+                            'psnr': None,
+                            'rmse': None
+                        }
+                    
+                    window_title = f"{self.noisy_image_display_title} - {denoised_title_str} Residuals{region_label}"
+                    
+                    # Launch residual analysis popup
+                    ResidualAnalysisPopup(self, 
+                                        main_residual=residual_data, 
+                                        metrics=metrics,
+                                        comparison_residual=None,
+                                        comparison_metrics=None,
+                                        main_title=f"{self.noisy_image_display_title} - {denoised_title_str}",
+                                        comparison_title=None,
+                                        window_title=window_title,
+                                        region_label=region_label)
+                except Exception as e:
+                    tkinter.messagebox.showerror("Calculation Error", f"Error calculating residuals: {str(e)}")
+                    print(f"Error in standard residual calculation: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    return
+                
         except Exception as e:
-            tkinter.messagebox.showerror("Residual Analysis Error", f"An unexpected error occurred: {str(e)}")
-            print(f"Unexpected error in open_residual_analysis_window: {e}")
+            tkinter.messagebox.showerror("Error", f"An error occurred during residual analysis: {str(e)}")
+            print(f"Residual analysis error: {e}")
+            import traceback
+            traceback.print_exc()
 
-
-    # ==================== PSD Calculation and Display ====================
 
 class ResidualAnalysisPopup(tk.Toplevel):
-    def __init__(self, master, residual_data, stats, title_prefix):
+    """
+    Popup window for analyzing residuals between images.
+    Shows residual image, histogram, and statistics.
+    Optionally shows comparison between two residuals.
+    """
+    def __init__(self, master, main_residual, metrics, 
+                 comparison_residual=None, comparison_metrics=None,
+                 main_title="Residual", comparison_title=None,
+                 window_title="Residual Analysis", region_label=""):
         super().__init__(master)
-        self.title(f"{title_prefix} - Eliminated Residuals")
-        self.geometry("700x550")
-
-        self.residual_data = residual_data
-        self.stats = stats
-
+        self.title(window_title)
+        self.geometry("800x650")
+        
+        # Ensure metrics dictionaries are properly initialized
+        if metrics is None:
+            print("WARNING: Metrics dictionary is None, creating empty dict")
+            metrics = {}
+        
+        if comparison_metrics is None:
+            comparison_metrics = {}
+        
+        # Store data
+        self.main_residual = main_residual
+        self.metrics = metrics
+        self.comparison_residual = comparison_residual
+        self.comparison_metrics = comparison_metrics
+        self.main_title = main_title
+        self.comparison_title = comparison_title
+        self.region_label = region_label
+        
+        # Ensure basic statistics are included
+        if main_residual is not None:
+            try:
+                residual_flat = main_residual.ravel()
+                # Removed mean calculation
+                self.metrics['std'] = self.metrics.get('std', np.std(residual_flat))
+                self.metrics['min'] = self.metrics.get('min', np.min(residual_flat))
+                self.metrics['max'] = self.metrics.get('max', np.max(residual_flat))
+                # Compute Kolmogorov-Smirnov test if missing
+                if 'pval' not in self.metrics:
+                    std_for_kstest = self.metrics['std'] if self.metrics['std'] > 1e-12 else 1e-12
+                    # Use zero instead of mean
+                    _, self.metrics['pval'] = kstest(residual_flat / std_for_kstest, 'norm')
+                # Compute skewness and kurtosis if missing
+                if 'skew' not in self.metrics:
+                    self.metrics['skew'] = skew(residual_flat, bias=False)
+                if 'kurt' not in self.metrics:
+                    self.metrics['kurt'] = kurtosis(residual_flat, fisher=False)
+            except Exception as e:
+                print(f"ERROR: Failed to calculate statistics for main residual: {e}")
+                # Set default values to avoid further errors
+                self.metrics['std'] = 0.01
+                self.metrics['min'] = np.min(residual_flat) if 'residual_flat' in locals() else -1
+                self.metrics['max'] = np.max(residual_flat) if 'residual_flat' in locals() else 1
+                self.metrics['pval'] = 0.5
+                self.metrics['skew'] = 0.0
+                self.metrics['kurt'] = 0.0
+        
+        # Ensure comparison metrics are included if available
+        if comparison_residual is not None:
+            try:
+                comp_flat = comparison_residual.ravel()
+                # Removed mean calculation
+                self.comparison_metrics['std'] = self.comparison_metrics.get('std', np.std(comp_flat))
+                self.comparison_metrics['min'] = self.comparison_metrics.get('min', np.min(comp_flat))
+                self.comparison_metrics['max'] = self.comparison_metrics.get('max', np.max(comp_flat))
+                # Compute Kolmogorov-Smirnov test if missing
+                if 'pval' not in self.comparison_metrics:
+                    std_for_kstest = self.comparison_metrics['std'] if self.comparison_metrics['std'] > 1e-12 else 1e-12
+                    # Use zero instead of mean 
+                    _, self.comparison_metrics['pval'] = kstest(comp_flat / std_for_kstest, 'norm')
+                # Compute skewness and kurtosis if missing
+                if 'skew' not in self.comparison_metrics:
+                    self.comparison_metrics['skew'] = skew(comp_flat, bias=False)
+                if 'kurt' not in self.comparison_metrics:
+                    self.comparison_metrics['kurt'] = kurtosis(comp_flat, fisher=False)
+            except Exception as e:
+                print(f"ERROR: Failed to calculate statistics for comparison residual: {e}")
+                # Set default values to avoid further errors
+                self.comparison_metrics['std'] = 0.01
+                self.comparison_metrics['min'] = np.min(comp_flat) if 'comp_flat' in locals() else -1
+                self.comparison_metrics['max'] = np.max(comp_flat) if 'comp_flat' in locals() else 1
+                self.comparison_metrics['pval'] = 0.5
+                self.comparison_metrics['skew'] = 0.0
+                self.comparison_metrics['kurt'] = 0.0
+        
+        # Create main container
         main_frame = ttk.Frame(self, padding="10")
         main_frame.pack(expand=True, fill='both')
-
-        # Top: Image display
-        image_frame = ttk.LabelFrame(main_frame, text="Eliminated Residuals Map", padding="5")
-        image_frame.pack(pady=5, fill="x")
         
-        self.image_canvas = tk.Canvas(image_frame, width=256, height=256, bg="black")
-        self.image_canvas.pack(pady=5, anchor='center')
-        self.display_residual_image()
-
-        # Bottom: Histogram and Stats
-        analysis_frame = ttk.LabelFrame(main_frame, text="Analysis", padding="5")
-        analysis_frame.pack(pady=5, fill="both", expand=True)
-
-        # Stats display on the left of histogram
-        stats_text_frame = ttk.Frame(analysis_frame)
-        stats_text_frame.pack(side='left', fill='y', padx=10, anchor='n')
+        # === Top section: Residual images ===
+        images_frame = ttk.LabelFrame(main_frame, text="Residual Images", padding="5")
+        images_frame.pack(pady=5, fill="x")
         
-        ttk.Label(stats_text_frame, text="Statistics:", font=('Helvetica', 12, 'bold')).pack(anchor='w', pady=(0,10))
+        # Main residual image
+        main_image_frame = ttk.Frame(images_frame)
+        main_image_frame.pack(side='left', padx=5, pady=5)
         
-        stats_str = (f"Mean: {self.stats['mean']:.4f}\n"
-                     f"Std Dev: {self.stats['std']:.4f}\n"
-                     f"Skewness: {self.stats['skew']:.4f}\n"
-                     f"Kurtosis: {self.stats['kurt']:.4f}\n"
-                     f"KS p-value: {self.stats['pval']:.4g}")
-        ttk.Label(stats_text_frame, text=stats_str, justify='left').pack(anchor='w')
-
-        # Q-Q Plot button below stats
-        qq_button = ttk.Button(stats_text_frame, text="Show Q-Q Plot", command=self.show_qq_plot_popup)
-        qq_button.pack(anchor='w', pady=10)
-
-        # Histogram on the right
-        self.hist_fig = Figure(figsize=(5, 4), dpi=100)
-        self.hist_ax = self.hist_fig.add_subplot(111)
-        self.hist_canvas = FigureCanvasTkAgg(self.hist_fig, master=analysis_frame)
-        self.hist_canvas.get_tk_widget().pack(side='right', fill='both', expand=True, padx=5)
+        ttk.Label(main_image_frame, text=main_title, font=('Helvetica', 10, 'bold')).pack(pady=(0, 5))
         
-        self.plot_residual_histogram()
-
-    def display_residual_image(self):
-        if self.residual_data is None: return
-        # Use 'minmax' for residuals as they can be negative/positive around zero
-        img_8bit = create_display_image(self.residual_data, method='minmax') 
-        pil_img = Image.fromarray(img_8bit, mode='L').resize((256,256), Image.BILINEAR)
-        self.tk_img = ImageTk.PhotoImage(pil_img)
-        self.image_canvas.create_image(0,0, anchor=tk.NW, image=self.tk_img)
-
-    def plot_residual_histogram(self):
-        data_flat = self.residual_data.ravel()
-        if data_flat.size == 0: return
-
-        self.hist_ax.clear()
+        self.main_canvas = tk.Canvas(main_image_frame, width=256, height=256, bg="black")
+        self.main_canvas.pack()
         
-        # Determine plot range for histogram, can use stats min/max or percentiles
-        # Using actual min/max of the residual data for full view
-        plot_min = self.stats.get('min', np.min(data_flat))
-        plot_max = self.stats.get('max', np.max(data_flat))
-        if plot_max - plot_min < 1e-9: # Handle constant data
-            plot_min -= 0.5
-            plot_max += 0.5
-
-        self.hist_ax.hist(data_flat, bins=50, density=True, alpha=0.7, color='skyblue', range=(plot_min, plot_max), label='Residuals')
-
-        # Overlay Gaussian fit
-        x_range = np.linspace(plot_min, plot_max, 200)
-        pdf = norm.pdf(x_range, loc=self.stats['mean'], scale=self.stats['std'] if self.stats['std'] > 1e-12 else 1e-12)
-        self.hist_ax.plot(x_range, pdf, 'r-', linewidth=2, label='Gaussian Fit')
-
-        self.hist_ax.set_title("Distribution of Eliminated Residuals")
-        self.hist_ax.set_xlabel("Value")
-        self.hist_ax.set_ylabel("Density")
-        self.hist_ax.legend()
+        # Comparison residual image (if provided)
+        if comparison_residual is not None:
+            comp_image_frame = ttk.Frame(images_frame)
+            comp_image_frame.pack(side='left', padx=5, pady=5)
+            
+            ttk.Label(comp_image_frame, text=comparison_title, font=('Helvetica', 10, 'bold')).pack(pady=(0, 5))
+            
+            self.comp_canvas = tk.Canvas(comp_image_frame, width=256, height=256, bg="black")
+            self.comp_canvas.pack()
+        
+        # === Middle section: Statistics ===
+        stats_frame = ttk.LabelFrame(main_frame, text="Statistics", padding="5")
+        stats_frame.pack(pady=5, fill="x")
+        
+        # Create main statistics
+        main_stats_frame = ttk.Frame(stats_frame)
+        main_stats_frame.pack(side='left', expand=True, fill='x', padx=10, pady=5)
+        
+        ttk.Label(main_stats_frame, text=f"{main_title} Statistics:", 
+                font=('Helvetica', 10, 'bold')).pack(anchor='w')
+        
+        # Basic statistics
+        basic_stats_str = (
+            # Removed mean from display
+            f"Std Dev: {metrics['std']:.4e}\n"
+            f"Skewness: {metrics['skew']:.4f}\n"
+            f"Kurtosis: {metrics['kurt']:.4f}\n"
+            f"KS p-value: {metrics['pval']:.4g}"
+        )
+        
+        # Add SNR/PSNR if available
+        if 'snr_db' in metrics and metrics['snr_db'] is not None and 'psnr' in metrics and metrics['psnr'] is not None:
+            snr_val = "∞" if np.isinf(metrics['snr_db']) else f"{metrics['snr_db']:.2f}"
+            psnr_val = "∞" if np.isinf(metrics['psnr']) else f"{metrics['psnr']:.2f}"
+            rmse_val = f"{metrics['rmse']:.4e}" if 'rmse' in metrics and metrics['rmse'] is not None else "N/A"
+            
+            basic_stats_str += f"\nSNR: {snr_val} dB\nPSNR: {psnr_val} dB\nRMSE: {rmse_val}"
+        
+        ttk.Label(main_stats_frame, text=basic_stats_str, justify='left').pack(anchor='w', pady=5)
+        
+        # Comparison statistics (if provided)
+        if comparison_metrics is not None:
+            comp_stats_frame = ttk.Frame(stats_frame)
+            comp_stats_frame.pack(side='left', expand=True, fill='x', padx=10, pady=5)
+            
+            ttk.Label(comp_stats_frame, text=f"{comparison_title} Statistics:", 
+                    font=('Helvetica', 10, 'bold')).pack(anchor='w')
+            
+            comp_stats_str = (
+                # Removed mean from display
+                f"Std Dev: {comparison_metrics.get('std', 0.0):.4e}\n"
+                f"Skewness: {comparison_metrics.get('skew', 0.0):.4f}\n"
+                f"Kurtosis: {comparison_metrics.get('kurt', 0.0):.4f}\n"
+                f"KS p-value: {comparison_metrics.get('pval', 0.5):.4g}"
+            )
+            
+            # Add SNR/PSNR if available
+            if ('snr_db' in comparison_metrics and comparison_metrics['snr_db'] is not None and
+                'psnr' in comparison_metrics and comparison_metrics['psnr'] is not None):
+                snr_val = "∞" if np.isinf(comparison_metrics['snr_db']) else f"{comparison_metrics['snr_db']:.2f}"
+                psnr_val = "∞" if np.isinf(comparison_metrics['psnr']) else f"{comparison_metrics['psnr']:.2f}"
+                rmse_val = f"{comparison_metrics['rmse']:.4e}" if 'rmse' in comparison_metrics and comparison_metrics['rmse'] is not None else "N/A"
+                
+                comp_stats_str += f"\nSNR: {snr_val} dB\nPSNR: {psnr_val} dB\nRMSE: {rmse_val}"
+            
+            ttk.Label(comp_stats_frame, text=comp_stats_str, justify='left').pack(anchor='w', pady=5)
+        
+        # === Bottom section: Histograms and plots ===
+        plots_frame = ttk.LabelFrame(main_frame, text="Distribution Analysis", padding="5")
+        plots_frame.pack(pady=5, fill='both', expand=True)
+        
+        # Create notebook for tabs
+        self.notebook = ttk.Notebook(plots_frame)
+        self.notebook.pack(fill='both', expand=True, padx=5, pady=5)
+        
+        # Tab 1: Histogram
+        hist_frame = ttk.Frame(self.notebook)
+        self.notebook.add(hist_frame, text="Histogram")
+        
+        # Tab 2: Q-Q Plot
+        qq_frame = ttk.Frame(self.notebook)
+        self.notebook.add(qq_frame, text="Q-Q Plot")
+        
+        # Initialize plots
+        self.init_histogram(hist_frame)
+        self.init_qq_plot(qq_frame)
+        
+        # Display residual images
+        self.display_residual_images()
+    
+    def init_histogram(self, parent):
+        """Initialize histogram plot"""
+        self.hist_fig = Figure(figsize=(7, 4), dpi=100)
+        
+        # Create one or two subplots depending on whether we have comparison data
+        if self.comparison_residual is not None:
+            self.hist_ax1 = self.hist_fig.add_subplot(121)
+            self.hist_ax2 = self.hist_fig.add_subplot(122)
+        else:
+            self.hist_ax1 = self.hist_fig.add_subplot(111)
+            self.hist_ax2 = None
+        
+        # Plot main residual histogram
+        self.plot_residual_histogram(self.hist_ax1, self.main_residual, self.metrics, self.main_title)
+        
+        # Plot comparison residual histogram if available
+        if self.comparison_residual is not None and self.hist_ax2 is not None:
+            self.plot_residual_histogram(self.hist_ax2, self.comparison_residual, 
+                                        self.comparison_metrics, self.comparison_title)
+        
         self.hist_fig.tight_layout()
+        
+        # Create canvas
+        self.hist_canvas = FigureCanvasTkAgg(self.hist_fig, master=parent)
         self.hist_canvas.draw()
-
-    def show_qq_plot_popup(self):
-        data_flat = self.residual_data.ravel()
-        if data_flat.size == 0:
-            tkinter.messagebox.showinfo("Q-Q Plot", "No data to plot.")
-            return
-
-        qq_window = tk.Toplevel(self) # Parent is the ResidualAnalysisPopup instance
-        qq_window.title("Q-Q Plot (Eliminated Residuals vs. Normal)")
-        qq_window.geometry("500x450")
-  
-        fig = Figure(figsize=(5, 4), dpi=100)
-        ax = fig.add_subplot(111)
-  
-        probplot(data_flat, dist="norm", plot=ax) # Uses SciPy's probplot
-        ax.set_title("Q-Q Plot against Normal Distribution")
-        ax.set_xlabel("Theoretical Quantiles")
-        ax.set_ylabel("Sample Quantiles")
-        fig.tight_layout()
-  
-        canvas = FigureCanvasTkAgg(fig, master=qq_window)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.hist_canvas.get_tk_widget().pack(fill='both', expand=True)
+    
+    def init_qq_plot(self, parent):
+        """Initialize Q-Q plot"""
+        self.qq_fig = Figure(figsize=(7, 4), dpi=100)
+        
+        # Create one or two subplots depending on whether we have comparison data
+        if self.comparison_residual is not None:
+            self.qq_ax1 = self.qq_fig.add_subplot(121)
+            self.qq_ax2 = self.qq_fig.add_subplot(122)
+        else:
+            self.qq_ax1 = self.qq_fig.add_subplot(111)
+            self.qq_ax2 = None
+        
+        # Plot main residual Q-Q plot
+        self.plot_qq(self.qq_ax1, self.main_residual, self.main_title)
+        
+        # Plot comparison residual Q-Q plot if available
+        if self.comparison_residual is not None and self.qq_ax2 is not None:
+            self.plot_qq(self.qq_ax2, self.comparison_residual, self.comparison_title)
+        
+        self.qq_fig.tight_layout()
+        
+        # Create canvas
+        self.qq_canvas = FigureCanvasTkAgg(self.qq_fig, master=parent)
+        self.qq_canvas.draw()
+        self.qq_canvas.get_tk_widget().pack(fill='both', expand=True)
+    
+    def plot_residual_histogram(self, ax, residual, metrics, title):
+        """Plot histogram with Gaussian fit overlay"""
+        try:
+            residual_flat = residual.ravel()
+            
+            # Compute histogram bins
+            bins = min(50, max(10, int(np.sqrt(len(residual_flat)))))
+            
+            # Plot histogram
+            ax.hist(residual_flat, bins=bins, density=True, alpha=0.7, color='skyblue')
+            
+            # Check if metrics contains the required keys
+            if metrics is None or 'std' not in metrics:
+                # Calculate std on the fly if necessary
+                std = np.std(residual_flat)
+                min_val = np.min(residual_flat)
+                max_val = np.max(residual_flat)
+                print(f"WARNING: Missing 'std' in metrics for {title}, calculated on the fly")
+            else:
+                std = metrics.get('std', np.std(residual_flat))
+                min_val = metrics.get('min', np.min(residual_flat))
+                max_val = metrics.get('max', np.max(residual_flat))
+            
+            # Ensure std is not too small to avoid issues
+            std = max(std, 1e-12)
+            
+            # Overlay Gaussian fit - use 0 as mean
+            x_range = np.linspace(min_val, max_val, 200)
+            pdf = norm.pdf(x_range, loc=0, scale=std)
+            ax.plot(x_range, pdf, 'r-', linewidth=2, label='Gaussian Fit (zero mean)')
+            
+            # Add labels
+            ax.set_title(f"{title} Distribution")
+            ax.set_xlabel("Residual Value")
+            ax.set_ylabel("Density")
+            ax.legend()
+        except Exception as e:
+            print(f"ERROR: Failed to create histogram for {title}: {e}")
+            ax.clear()
+            ax.text(0.5, 0.5, f"Error creating histogram: {str(e)}", 
+                    ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(f"{title} - Error")
+    
+    def plot_qq(self, ax, residual, title):
+        """Plot Q-Q plot against normal distribution"""
+        try:
+            residual_flat = residual.ravel()
+            # Use loc=0 to compare against a zero-mean normal distribution
+            probplot(residual_flat, dist="norm", plot=ax, fit=False)
+            ax.set_title(f"{title} Q-Q Plot")
+            ax.grid(True, linestyle='--', alpha=0.6)
+        except Exception as e:
+            print(f"ERROR: Failed to create Q-Q plot for {title}: {e}")
+            ax.clear()
+            ax.text(0.5, 0.5, f"Error creating Q-Q plot: {str(e)}", 
+                    ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(f"{title} Q-Q Plot - Error")
+    
+    def display_residual_images(self):
+        """Display the residual images on canvases"""
+        try:
+            # Display main residual
+            if self.main_residual is not None:
+                img_8bit = create_display_image(self.main_residual, method='minmax')  # Use minmax for residuals
+                pil_img = Image.fromarray(img_8bit, mode='L').resize((256, 256), Image.BILINEAR)
+                self.main_photo = ImageTk.PhotoImage(pil_img)
+                self.main_canvas.create_image(0, 0, anchor=tk.NW, image=self.main_photo)
+            
+            # Display comparison residual if available
+            if self.comparison_residual is not None and hasattr(self, 'comp_canvas'):
+                comp_8bit = create_display_image(self.comparison_residual, method='minmax')
+                comp_pil_img = Image.fromarray(comp_8bit, mode='L').resize((256, 256), Image.BILINEAR)
+                self.comp_photo = ImageTk.PhotoImage(comp_pil_img)
+                self.comp_canvas.create_image(0, 0, anchor=tk.NW, image=self.comp_photo)
+        except Exception as e:
+            print(f"Error displaying residual images: {e}")
+            # Display error message on canvas
+            if hasattr(self, 'main_canvas'):
+                self.main_canvas.create_text(128, 128, text=f"Error displaying image: {str(e)}", 
+                                          fill="white", anchor=tk.CENTER)
 
 # Main application setup (if any, usually at the end of the file)
 # For example:

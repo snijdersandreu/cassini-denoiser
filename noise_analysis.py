@@ -303,40 +303,46 @@ def calculate_snr_with_ground_truth(denoised_image, clean_image):
     Calculate Signal-to-Noise Ratio (SNR) using a clean ground truth image as reference.
     
     This calculates:
-    1. MSE (Mean Squared Error) between denoised and ground truth
+    1. MSE (Mean Squared Error) between input image and ground truth
     2. RMSE (Root Mean Squared Error)
     3. PSNR (Peak Signal-to-Noise Ratio)
     4. SNR (Signal-to-Noise Ratio in dB)
     
     Parameters:
-        denoised_image (ndarray): The denoised image
+        denoised_image (ndarray): The input image (could be denoised or noisy)
         clean_image (ndarray): The ground truth clean image
         
     Returns:
         dict: Dictionary containing 'mse', 'rmse', 'psnr', 'snr_db'
     """
     if denoised_image.shape != clean_image.shape:
-        raise ValueError("Denoised and ground truth images must have the same shape")
+        raise ValueError("Input and ground truth images must have the same shape")
+    
+    # Calculate noise as the difference between the input image and clean reference
+    noise = denoised_image - clean_image
     
     # Calculate error metrics
-    mse = np.mean((denoised_image - clean_image) ** 2)
+    mse = np.mean(noise ** 2)
     rmse = np.sqrt(mse)
     
     # Calculate signal power (from ground truth)
     signal_power = np.mean(clean_image ** 2)
     
+    # Calculate noise power from the extracted noise
+    noise_power = np.mean(noise ** 2)  # Same as mse
+    
     # Calculate PSNR (using max value of clean image as peak)
     data_range = np.max(clean_image) - np.min(clean_image)
-    if data_range < 1e-10 or mse < 1e-10:  # Avoid division by zero
+    if data_range < 1e-10 or rmse < 1e-10:  # Avoid division by zero
         psnr = np.inf
     else:
         psnr = 20 * np.log10(data_range / rmse)
     
     # Calculate SNR in dB
-    if mse < 1e-10:  # Avoid division by zero
+    if noise_power < 1e-10:  # Avoid division by zero
         snr_db = np.inf
     else:
-        snr_db = 10 * np.log10(signal_power / mse)
+        snr_db = 10 * np.log10(signal_power / noise_power)
     
     return {
         "mse": mse,
