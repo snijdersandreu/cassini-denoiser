@@ -144,6 +144,31 @@ class DenoiseWindow(tk.Toplevel):
             variable=self.bm3d_var
         ).pack(anchor="w", padx=10, pady=5)
 
+        # Add parameters for BM3D
+        bm3d_params_frame = ttk.Frame(self.control_frame)
+        bm3d_params_frame.pack(fill='x', padx=20, pady=2)
+
+        # Sigma input (noise standard deviation)
+        ttk.Label(bm3d_params_frame, text="Sigma:").grid(row=0, column=0, sticky="w")
+        self.bm3d_sigma_var = tk.StringVar(value="")
+        ttk.Entry(bm3d_params_frame, textvariable=self.bm3d_sigma_var, width=8).grid(row=0, column=1, padx=5)
+        ttk.Label(bm3d_params_frame, text="(estimate if empty)").grid(row=0, column=2, sticky="w")
+
+        # Block size input
+        ttk.Label(bm3d_params_frame, text="Block size:").grid(row=1, column=0, sticky="w")
+        self.bm3d_block_size_var = tk.StringVar(value="8")
+        ttk.Entry(bm3d_params_frame, textvariable=self.bm3d_block_size_var, width=8).grid(row=1, column=1, padx=5)
+
+        # Max blocks input
+        ttk.Label(bm3d_params_frame, text="Max blocks:").grid(row=2, column=0, sticky="w")
+        self.bm3d_max_blocks_var = tk.StringVar(value="16")
+        ttk.Entry(bm3d_params_frame, textvariable=self.bm3d_max_blocks_var, width=8).grid(row=2, column=1, padx=5)
+
+        # Threshold multiplier
+        ttk.Label(bm3d_params_frame, text="Threshold:").grid(row=3, column=0, sticky="w")
+        self.bm3d_threshold_var = tk.StringVar(value="2.7")
+        ttk.Entry(bm3d_params_frame, textvariable=self.bm3d_threshold_var, width=8).grid(row=3, column=1, padx=5)
+
         self.unet_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             self.control_frame,
@@ -615,8 +640,86 @@ class DenoiseWindow(tk.Toplevel):
             
         if self.bm3d_var.get():
             try:
+                # Parse BM3D parameters
+                custom_params = {}
+                
+                # Parse sigma
+                sigma_str = self.bm3d_sigma_var.get().strip()
+                if sigma_str:
+                    try:
+                        sigma_val = float(sigma_str)
+                        # Adjust sigma based on the percentile scaling factor used
+                        sigma_adjusted = sigma_val / self.scale_factor if self.rescale_var.get() else sigma_val
+                    except ValueError:
+                        sigma_adjusted = None
+                        print("Invalid sigma value, using automatic estimation")
+                else:
+                    sigma_adjusted = None
+                
+                # Parse block size
+                try:
+                    block_size = int(self.bm3d_block_size_var.get())
+                    if block_size > 0:
+                        custom_params['block_size'] = block_size
+                except ValueError:
+                    pass
+                
+                # Parse max blocks
+                try:
+                    max_blocks = int(self.bm3d_max_blocks_var.get())
+                    if max_blocks > 0:
+                        custom_params['max_blocks'] = max_blocks
+                except ValueError:
+                    pass
+                
+                # Parse threshold multiplier
+                try:
+                    threshold = float(self.bm3d_threshold_var.get())
+                    if threshold > 0:
+                        custom_params['hard_threshold'] = threshold
+                except ValueError:
+                    pass
+                
+                # Create progress dialog
+                progress_win = tk.Toplevel(self)
+                progress_win.title("BM3D Processing")
+                progress_win.geometry("300x100")
+                progress_win.transient(self)
+                progress_win.grab_set()
+                
+                progress_label = ttk.Label(progress_win, text="Processing BM3D... This may take a while")
+                progress_label.pack(pady=(10, 5))
+                
+                progress_var = tk.DoubleVar(value=0.0)
+                progress_bar = ttk.Progressbar(progress_win, variable=progress_var, length=250, mode='determinate')
+                progress_bar.pack(pady=5, padx=20)
+                
+                status_label = ttk.Label(progress_win, text="Initializing...")
+                status_label.pack(pady=5)
+                
+                # Define progress callback
+                def update_progress(progress_value):
+                    progress_var.set(progress_value * 100)
+                    if progress_value < 0.5:
+                        status = f"Step 1: Hard thresholding ({progress_value*200:.0f}%)"
+                    else:
+                        status = f"Step 2: Wiener filtering ({(progress_value-0.5)*200:.0f}%)"
+                    status_label.config(text=status)
+                    progress_win.update()
+                
                 # Apply BM3D to the *potentially scaled* data 'arr'
-                den_scaled = bm3d.bm3d_denoise(arr) 
+                print("Starting BM3D processing...")
+                den_scaled = bm3d.bm3d_denoise(
+                    arr, 
+                    sigma=sigma_adjusted,
+                    stage='all',
+                    debug=True,
+                    callback=update_progress
+                )
+                
+                # Close progress window
+                progress_win.grab_release()
+                progress_win.destroy()
                 
                 # Maintain consistent scaling approach
                 if self.rescale_var.get():
@@ -631,8 +734,18 @@ class DenoiseWindow(tk.Toplevel):
                 self.show_result("BM3D", den_display, display_data_original)
             except Exception as e:
                 print(f"BM3D failed: {e}")
+                import traceback
+                traceback.print_exc()
                 den = None
                 self.show_result("BM3D", den, display_data_original)
+                
+                # Close progress window if it's still open
+                if 'progress_win' in locals() and progress_win.winfo_exists():
+                    progress_win.grab_release()
+                    progress_win.destroy()
+                    
+                # Show error message
+                tkinter.messagebox.showerror("BM3D Error", f"BM3D processing failed: {str(e)}")
             
         if self.unet_var.get():
             try:
