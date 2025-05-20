@@ -1,47 +1,89 @@
 # CASSINI DENOISER
-Tools to perform noise analysis on Images from the Cassini-Huygens mission.
 
-## Repository set-up
+A collection of tools for noise analysis and image denoising, primarily focused on images from the Cassini-Huygens mission. This project provides a graphical user interface (GUI) for applying various denoising algorithms, viewing PDS (Planetary Data System) files, and several scripts for data analysis and simulation.
 
-### Python virtual environment
+## Features
 
-After cloning this repository, you need to create a new python virtual environment.
-If you are using any respectable IDE (ex: pycharm, etc.), 
-it will automatically create it for you and auto-activate it when needed.
+*   **Interactive Denoising GUI**: `denoise_window.py` offers a user-friendly interface to load images, apply denoising algorithms, and visualize results.
+*   **PDS File Support**: Includes tools (`pds.py`, `pds_viewer.py`) for parsing and viewing Cassini .IMG and .LBL files.
+*   **Multiple Denoising Algorithms**:
+    *   Non-Local Means (NLM)
+    *   Starlet Transform Denoising
+    *   BM3D
+    *   UNet Self2Self (Deep Learning based)
+    *   Wiener Filter
+*   **Image Analysis Tools**: Scripts for noise characterization, Signal-to-Noise Ratio (SNR) analysis, contrast analysis, and histogram analysis.
+*   **Image Simulation**: Utilities like `adapt_simulation.py` for creating simulated datasets.
 
-If not, create one manually:
-```shell
-python3 -m venv venv
-```
+## Project Structure
 
-and activate it every time you open a new shell:
-```shell
-source venv/bin/activate
-```
+*   `denoise_window.py`: The main graphical user interface for image denoising.
+*   `pds_viewer.py`: A tool for viewing PDS images and their metadata.
+*   `denoising_algorithms/`: Contains Python implementations of various denoising algorithms.
+*   `analyze_*.py`, `contrast_analysis.py`, etc.: Various scripts for specific analysis tasks.
+*   `pds.py`: Core module for PDS file parsing.
+*   `image_utils.py`: Utility functions for image manipulation.
+*   `LUT/`: Directory for Lookup Tables.
+*   `data/`: Intended for storing sample or user-provided image data (create if it doesn't exist).
+*   `requirements.txt`: Lists project dependencies.
+*   `LICENSE`: Project license information.
 
-### Python packages
+## Setup
 
-After activating a virtual environment, install all the required python packages:
-```shell
-pip3 install -r requirements.txt
-```
+### Python Virtual Environment
 
-## Execute GUI tools
+After cloning this repository, it's highly recommended to create and activate a Python virtual environment.
 
-Auto-prompt for the input files:
-
-```shell
-python .\gui_region_analysis.py
-```
-
-or, specifying the args directly:
-
-```shell
-python .\gui_region_analysis.py  --header data/N1473172656_1.LBL --image data/N1473172656_1.IMG --output output/gui_analysis
-```
-
-## Compile into EXE
+If you are using an IDE like PyCharm, it may handle this for you. Otherwise, create one manually:
 
 ```shell
-pyinstaller --onefile --windowed --name "ImageNoiseAnalysis" --icon="icons/sound_wave.ico" gui_region_analysis.py
+python3 -m venv .venv
 ```
+
+Activate it (on macOS/Linux):
+
+```shell
+source .venv/bin/activate
+```
+
+Or on Windows:
+
+```shell
+.venv\Scripts\activate
+```
+
+### Python Packages
+
+With the virtual environment activated, install the required Python packages:
+
+```shell
+pip install -r requirements.txt
+```
+
+## Usage
+
+### Main Denoising Application
+
+To run the main GUI for denoising:
+
+```shell
+python denoise_window.py
+```
+
+### PDS Image Viewer
+
+To run the PDS image viewer:
+
+```shell
+python pds_viewer.py
+```
+
+Other Python scripts in the repository can be run similarly, e.g., `python analyze_snr.py`. Some scripts may accept command-line arguments; refer to their source code for details.
+
+## Dependencies
+
+All Python dependencies are listed in `requirements.txt`.
+
+## License
+
+This project is licensed under the terms of the MIT License. See the `LICENSE` file for more details.

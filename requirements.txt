@@ -1,8 +1,6 @@
-astropy
 numpy
 matplotlib
 scipy
 pandas
-pillow
+Pillow
 pyinstaller
-scikit-image
