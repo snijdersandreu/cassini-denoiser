@@ -10,12 +10,15 @@ from denoising_algorithms import starlet
 from denoising_algorithms import bm3d
 from denoising_algorithms import unet_self2self
 from denoising_algorithms import wiener as custom_wiener
+from denoising_algorithms import nlm_denoising # Add NLM import
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.pyplot as plt
 from scipy.ndimage import map_coordinates # For radial profile
 from scipy.stats import norm, skew, kurtosis, kstest, probplot # Added skew, kurtosis, kstest, probplot
 import tkinter.messagebox # Added for popups
+import threading # Added for NLM threading
+import queue     # Added for NLM threading
 
 # Need laplace for new metrics
 from scipy.ndimage import laplace
@@ -175,6 +178,31 @@ class DenoiseWindow(tk.Toplevel):
             text="UNET-Self2Self",
             variable=self.unet_var
         ).pack(anchor="w", padx=10, pady=5)
+
+        # NLM Denoising
+        self.nlm_var = tk.BooleanVar(value=False)
+        nlm_frame = ttk.Frame(self.control_frame)
+        nlm_frame.pack(fill='x', padx=10, pady=5)
+        ttk.Checkbutton(
+            nlm_frame,
+            text="Non-Local Means (NLM)",
+            variable=self.nlm_var
+        ).pack(anchor="w")
+
+        nlm_params_frame = ttk.Frame(nlm_frame)
+        nlm_params_frame.pack(fill='x', padx=20, pady=2)
+
+        ttk.Label(nlm_params_frame, text="Patch Size:").grid(row=0, column=0, sticky="w")
+        self.nlm_patch_size_var = tk.StringVar(value="7")
+        ttk.Entry(nlm_params_frame, textvariable=self.nlm_patch_size_var, width=8).grid(row=0, column=1, padx=5)
+
+        ttk.Label(nlm_params_frame, text="Patch Distance:").grid(row=1, column=0, sticky="w")
+        self.nlm_patch_distance_var = tk.StringVar(value="10")
+        ttk.Entry(nlm_params_frame, textvariable=self.nlm_patch_distance_var, width=8).grid(row=1, column=1, padx=5)
+
+        ttk.Label(nlm_params_frame, text="h (filtering):").grid(row=2, column=0, sticky="w")
+        self.nlm_h_var = tk.StringVar(value="0.1")
+        ttk.Entry(nlm_params_frame, textvariable=self.nlm_h_var, width=8).grid(row=2, column=1, padx=5)
 
         # Rescaling options
         rescale_frame = ttk.LabelFrame(self.control_frame, text="Image Rescaling")
@@ -767,6 +795,57 @@ class DenoiseWindow(tk.Toplevel):
                 print(f"UNET-Self2Self failed: {e}")
                 den = None
                 self.show_result("UNET-Self2Self", den, display_data_original)
+
+        if self.nlm_var.get():
+            # Parse NLM parameters (synchronous part)
+            try:
+                patch_size = int(self.nlm_patch_size_var.get())
+                patch_distance = int(self.nlm_patch_distance_var.get())
+                h_param = float(self.nlm_h_var.get())
+                if patch_size <= 0 or patch_distance <= 0 or h_param <= 0:
+                    raise ValueError("NLM parameters must be positive.")
+            except ValueError as e_param_parse:
+                print(f"Invalid NLM parameters: {e_param_parse}. Using defaults.")
+                patch_size = 7
+                patch_distance = 10
+                h_param = 0.1
+                self.nlm_patch_size_var.set(str(patch_size))
+                self.nlm_patch_distance_var.set(str(patch_distance))
+                self.nlm_h_var.set(str(h_param))
+                # Proceed with defaults if parsing failed
+
+            # --- Start of threaded NLM execution ---
+            print(f"Starting NLM Denoise with patch_size={patch_size}, patch_distance={patch_distance}, h={h_param}...")
+            self.show_nlm_processing_dialog()
+
+            self.nlm_result_queue = queue.Queue()
+            # Pass a copy of arr to be safe, especially if arr might be a view or shared.
+            # NLM itself pads, creating internal copies for that, but this is an extra precaution.
+            arr_copy_for_nlm = arr.copy()
+
+            # Define the progress callback for NLM
+            def nlm_gui_progress_callback(percentage):
+                if hasattr(self, 'nlm_progress_win') and self.nlm_progress_win.winfo_exists():
+                    # Schedule the GUI update in the main Tkinter thread
+                    self.nlm_progress_win.after(0, self.update_nlm_progress, percentage)
+
+            nlm_args = (arr_copy_for_nlm, patch_size, patch_distance, h_param)
+            nlm_kwargs = {'progress_callback': nlm_gui_progress_callback, 'debug': True} # Pass callback and debug
+
+            def nlm_worker_thread():
+                try:
+                    den_scaled_result = nlm_denoising.nlm_denoise(*nlm_args, **nlm_kwargs)
+                    self.nlm_result_queue.put(den_scaled_result)
+                except Exception as e_thread:
+                    self.nlm_result_queue.put(e_thread) # Put the exception in the queue
+            
+            self.nlm_thread = threading.Thread(target=nlm_worker_thread)
+            self.nlm_thread.daemon = True # Ensure thread exits when main program exits
+            self.nlm_thread.start()
+
+            # Start checking the queue for the result
+            self.check_nlm_result(display_data_original)
+            # --- End of threaded NLM execution ---
 
         # After all results are shown and widgets created, update their plots
         self.update_all_metrics() # This will now calculate and plot PSDs
@@ -1377,129 +1456,148 @@ class DenoiseWindow(tk.Toplevel):
 
     # =================== Single Value Metric Calculations ==================
 
-    def calculate_ground_truth_metrics(self, input_image, clean_image):
+    def calculate_ground_truth_metrics(self, input_image_arg, clean_image_raw_arg):
         """
-        Calculate SNR and PSNR metrics between input image and clean reference.
-        Ensures both images are on the same scale before calculation.
-        
-        This is a direct implementation similar to analyze_snr.py.
+        Calculate SNR, PSNR, RMSE, and other statistical metrics between an input image 
+        and a clean reference image. Handles scaling consistently based on self.rescale_var.
         
         Parameters:
-            input_image (ndarray): Input image data (noisy or denoised)
-            clean_image (ndarray): Clean reference image
+            input_image_arg (ndarray): Input image data (e.g., noisy or denoised).
+                                     If self.rescale_var is ON, this is expected to be
+                                     the output of a denoiser that processed an already scaled image.
+            clean_image_raw_arg (ndarray): Raw clean reference image data.
             
         Returns:
-            dict: Containing SNR, PSNR, RMSE and other metrics
+            dict: Containing various metrics including std, skewness, kurtosis of the residual.
         """
-        # Check for rescale checkbox state (important for consistent scaling)
-        needs_rescaling = self.rescale_var.get()
         
-        # Get the scale parameters from the main denoise window
-        if hasattr(self, 'p1') and hasattr(self, 'scale_factor'):
-            p1 = self.p1
-            scale_factor = self.scale_factor
-        else:
-            # No scaling info available, assume no scaling needed
-            p1 = 0.0
-            scale_factor = 1.0
-            needs_rescaling = False
-            
-        # Get image ranges
-        input_min, input_max = np.min(input_image), np.max(input_image) 
-        clean_min, clean_max = np.min(clean_image), np.max(clean_image)
+        processed_input = input_image_arg.copy()
+        processed_clean = clean_image_raw_arg.copy()
         
-        print(f"Original ranges - Input: [{input_min:.4f}, {input_max:.4f}], Clean: [{clean_min:.4f}, {clean_max:.4f}]")
-        print(f"Scaling info - p1: {p1:.4f}, scale_factor: {scale_factor:.4f}, needs_rescaling: {needs_rescaling}")
-        
-        # Determine if input is already in the [0,1] range
-        input_is_normalized = (input_max <= 1.1 and input_min >= -0.1)
-        clean_is_normalized = (clean_max <= 1.1 and clean_min >= -0.1)
-        
-        # Make working copies to avoid modifying originals
-        input_data = input_image.copy()
-        clean_data = clean_image.copy()
-        
-        # Cases:
-        # 1. If rescale option is enabled: scale both to [0,1] using the same params
-        # 2. If not, but one is normalized and other isn't: normalize the non-normalized one
-        # 3. If both are in same range (both normalized or both original): no scaling needed
-        
-        if needs_rescaling and scale_factor > 1e-8:
-            # Case 1: Rescale both consistently to [0,1] using same parameters
-            if not input_is_normalized:
-                input_data = (input_image - p1) / scale_factor
-                print(f"Rescaled input from [{input_min:.4f}, {input_max:.4f}] to [0,1] range")
+        # Determine scaling parameters if rescaling is enabled
+        p1_to_use = 0.0
+        scale_factor_to_use = 1.0
+        rescaling_possible = False
+
+        if self.rescale_var.get(): # Checkbox is ON
+            if hasattr(self, 'p1') and hasattr(self, 'scale_factor') and self.scale_factor > 1e-8:
+                p1_to_use = self.p1
+                scale_factor_to_use = self.scale_factor
+                rescaling_possible = True
                 
-            if not clean_is_normalized:  
-                clean_data = (clean_image - p1) / scale_factor
-                print(f"Rescaled clean from [{clean_min:.4f}, {clean_max:.4f}] to [0,1] range")
+                # input_image_arg (e.g., den_display) is already conceptually scaled.
+                # Do not modify processed_input based on p1/scale_factor here.
                 
-        elif input_is_normalized != clean_is_normalized:
-            # Case 2: One is normalized and other isn't
-            if input_is_normalized:
-                # Input is [0,1], scale clean to match
-                clean_range = clean_max - clean_min
-                if clean_range > 1e-8:
-                    clean_data = (clean_image - clean_min) / clean_range
-                    print(f"Matched scaling: Normalized clean to [0,1]")
-                else:
-                    clean_data = np.zeros_like(clean_image)
-                    print("Warning: Clean image has zero range")
+                # Scale the raw clean image using the noisy image's p1 and scale_factor
+                processed_clean = (clean_image_raw_arg - p1_to_use) / scale_factor_to_use
+                
+                print(f"DEBUG calculate_gt_metrics (Rescale ON):")
+                print(f"  Input (e.g., den_display) original range: [{np.min(input_image_arg):.4f}, {np.max(input_image_arg):.4f}] -> Used as is.")
+                print(f"  Clean (raw) range: [{np.min(clean_image_raw_arg):.4f}, {np.max(clean_image_raw_arg):.4f}]")
+                print(f"  Clean scaled by noisy's p1={p1_to_use:.4f}, sf={scale_factor_to_use:.4f}: [{np.min(processed_clean):.4f}, {np.max(processed_clean):.4f}]")
             else:
-                # Clean is [0,1], scale input to match
-                input_range = input_max - input_min
-                if input_range > 1e-8:
-                    input_data = (input_image - input_min) / input_range
-                    print(f"Matched scaling: Normalized input to [0,1]")
-                else:
-                    input_data = np.zeros_like(input_image)
-                    print("Warning: Input image has zero range")
-        else:
-            # Case 3: Both in same range (both normalized or both in original range)
-            print("Both images already in same range, no rescaling needed")
+                # Rescale ON but p1/scale_factor not found. Metrics will be on raw images.
+                print("WARNING calculate_gt_metrics (Rescale ON): p1/scale_factor not found. Using raw images for metrics.")
+        # Else (Checkbox is OFF), processed_input and processed_clean remain copies of raw args.
+
+        # Calculate the residual (noise)
+        noise = processed_input - processed_clean
+        noise_flat = noise.ravel()
+        
+        # --- Basic residual statistics ---
+        noise_mean = np.mean(noise_flat)
+        noise_std = np.std(noise_flat)
+        noise_min = np.min(noise_flat)
+        noise_max = np.max(noise_flat)
+        
+        # Skewness (Pearson's moment coefficient of skewness)
+        # bias=False for sample skewness
+        try:
+            noise_skew = skew(noise_flat, bias=False)
+        except ValueError: # Can happen for constant arrays
+            noise_skew = 0.0 
             
-        # Extract noise as the difference between input and clean
-        noise = input_data - clean_data
+        # Kurtosis (Pearson's definition, where 3 is normal)
+        # fisher=False for Pearson's kurtosis. fisher=True for excess kurtosis.
+        try:
+            noise_kurt = kurtosis(noise_flat, fisher=False) 
+        except ValueError:
+            noise_kurt = 3.0 # Kurtosis of a constant is undefined, use normal's as placeholder
+
+        # Kolmogorov-Smirnov test for normality
+        # Test against a normal distribution with mean=0 and std=1 after standardizing
+        # Standardize the residual: (value - mean) / std
+        # However, kstest is often used to test if data comes from a specific distribution (e.g. N(0, sigma_hat))
+        # For simplicity here, we test if (noise_flat - noise_mean) / noise_std is N(0,1)
+        # If noise_std is very small, avoid division by zero.
+        ks_stat = 0.0
+        ks_pval = 0.0 # Default to 0 (reject H0) if test can't run
+        if noise_std > 1e-12:
+            try:
+                # Test standardized residuals against a standard normal distribution N(0,1)
+                standardized_noise = (noise_flat - noise_mean) / noise_std
+                ks_stat, ks_pval = kstest(standardized_noise, 'norm')
+            except Exception as e_kstest:
+                print(f"Warning: KStest failed: {e_kstest}")
+                ks_pval = 0.0 # Indicate failure / strong non-normality
+        else: # If std is zero (constant residual), it's not normally distributed in a typical sense
+            ks_pval = 0.0 
+            if np.all(noise_flat == noise_flat[0]): # if truly constant
+                 # A single point distribution is not normal. KS test might give pval=1 if N=1.
+                 # For N > 1 and constant, pval should be low.
+                 if len(noise_flat) > 1: ks_pval = 0.0
+                 else: ks_pval = 1.0 # Or handle as undefined for N=1. For now, 1.0.
+
+
+        # --- SNR, PSNR, RMSE ---
+        # Calculate signal power (from the processed clean image)
+        signal_power = np.mean(processed_clean ** 2)
         
-        # Calculate signal power (from clean image)
-        signal_power = np.mean(clean_data ** 2)
+        # Calculate noise power (MSE of the residual)
+        # This is mean of squared errors, where error = residual = noise
+        mse = np.mean(noise ** 2) # This is E[residual^2]
         
-        # Calculate noise power
-        noise_power = np.mean(noise ** 2)
+        # RMSE
+        rmse = np.sqrt(mse)
         
-        # Calculate SNR
-        if noise_power < 1e-10:  # Avoid division by zero
+        # SNR
+        if mse < 1e-12:  # Avoid division by zero if noise is effectively zero
             snr_linear = float('inf')
             snr_db = float('inf')
         else:
-            snr_linear = signal_power / noise_power
-            snr_db = 10 * np.log10(snr_linear)
+            # SNR = P_signal / P_noise = P_signal / MSE
+            snr_linear = signal_power / mse 
+            if snr_linear < 1e-9 : # Avoid log(0) or log(very small number)
+                 snr_db = -float('inf') # Or a very large negative number
+            else:
+                 snr_db = 10 * np.log10(snr_linear)
         
-        # Calculate RMSE
-        rmse = np.sqrt(noise_power)
-        
-        # Calculate PSNR
-        data_range = np.max(clean_data) - np.min(clean_data)
-        if rmse < 1e-10 or data_range < 1e-10:
+        # PSNR
+        # Data range is from the processed clean image
+        data_range = np.max(processed_clean) - np.min(processed_clean)
+        if rmse < 1e-12 or data_range < 1e-10: # If RMSE is zero or data_range is zero
             psnr = float('inf')
         else:
             psnr = 20 * np.log10(data_range / rmse)
             
-        # Return all metrics in a dictionary
         return {
-            'mse': noise_power,
+            'mse': mse,
             'rmse': rmse,
             'psnr': psnr,
             'snr_db': snr_db,
             'snr_linear': snr_linear,
             'signal_power': signal_power,
-            'noise_power': noise_power,
-            'noise_min': np.min(noise),
-            'noise_max': np.max(noise),
-            'noise_mean': np.mean(noise),
-            'noise_std': np.std(noise),
-            'scaled_clean': clean_data,  # The properly scaled clean image
-            'scaled_residual': noise  # The computed residual/noise after proper scaling
+            'noise_power': mse, # Noise power is MSE
+            'noise_min': noise_min,
+            'noise_max': noise_max,
+            'noise_mean': noise_mean,
+            'noise_std': noise_std,
+            'noise_skew': noise_skew,
+            'noise_kurt': noise_kurt,
+            'ks_stat': ks_stat,
+            'ks_pval': ks_pval,
+            'scaled_clean_used_for_metrics': processed_clean, # The version of clean image used for metrics
+            'scaled_residual': noise  # The computed residual used for metrics
         }
 
     # ==================== Residual Analysis =====================
@@ -1544,102 +1642,141 @@ class DenoiseWindow(tk.Toplevel):
             
             # === CASE 1: Clean reference image exists (NPZ files) ===
             if self.clean_image_data is not None:
-                clean_image_full = self.clean_image_data
-                
-                # Get clean image data for the same region
+                # --- Prepare Slices --- 
+                # denoised_data and clean_data_for_denoised_comparison should correspond to the same region.
+                # original_noisy_data_slice and clean_data_for_noisy_comparison should correspond to the same region.
+
+                # Denoised data slice (already scaled if rescale_var is ON)
+                denoised_data_slice = denoised_data # This is already sliced based on selected_region or full
+
+                # Raw clean data slice corresponding to denoised_data_slice region
+                raw_clean_slice_for_denoised_comp = None
                 if selected_region:
                     dx0, dy0, dx1, dy1 = selected_region
-                    if dx1 <= clean_image_full.shape[1] and dy1 <= clean_image_full.shape[0]:
-                        clean_data = clean_image_full[dy0:dy1, dx0:dx1]
-                    else:
-                        # Handle mismatched shapes - fall back to full images
-                        tkinter.messagebox.showwarning("Shape Mismatch", "Selected region exceeds clean image dimensions. Using full images.")
-                        denoised_data = denoised_image_data_full
-                        clean_data = clean_image_full
-                        region_label = " (Full Image - Fallback)"
+                    if dx1 <= self.clean_image_data.shape[1] and dy1 <= self.clean_image_data.shape[0]:
+                        raw_clean_slice_for_denoised_comp = self.clean_image_data[dy0:dy1, dx0:dx1]
+                    else: # Fallback if region is out of bounds for clean image
+                        raw_clean_slice_for_denoised_comp = self.clean_image_data
+                        denoised_data_slice = denoised_image_data_full # Match scope
+                        print("Warning: Region out of bounds for clean image. Using full images for denoised vs. clean.")
                 else:
-                    clean_data = clean_image_full
+                    raw_clean_slice_for_denoised_comp = self.clean_image_data
                 
-                # Ensure shapes match
-                if denoised_data.shape != clean_data.shape:
-                    tkinter.messagebox.showwarning("Shape Mismatch", 
-                                                  f"Denoised shape {denoised_data.shape} and clean shape {clean_data.shape} do not match. Using full images.")
-                    denoised_data = denoised_image_data_full
-                    clean_data = clean_image_full
-                    region_label = " (Full Image - Fallback)"
+                # Ensure denoised_data_slice and raw_clean_slice_for_denoised_comp have matching shapes
+                if denoised_data_slice.shape != raw_clean_slice_for_denoised_comp.shape:
+                    print(f"Shape mismatch: Denoised slice {denoised_data_slice.shape}, Clean slice for denoised {raw_clean_slice_for_denoised_comp.shape}. Attempting full images.")
+                    denoised_data_slice = denoised_image_data_full
+                    raw_clean_slice_for_denoised_comp = self.clean_image_data
+                    if denoised_data_slice.shape != raw_clean_slice_for_denoised_comp.shape:
+                        tkinter.messagebox.showerror("Shape Error", "Cannot align denoised and clean image shapes for residual analysis.")
+                        return
+                    region_label += " (Full Fallback)" # Append to existing region_label
+
+                # Original noisy data slice (scaled if rescale_var is ON) and its corresponding raw clean slice
+                original_noisy_data_slice = None # This will be SCALED if rescale_var is ON
+                raw_clean_slice_for_noisy_comp = None
                 
-                try:
-                    # Get properly scaled data using our ground truth metrics calculator
-                    metrics = self.calculate_ground_truth_metrics(denoised_data, clean_data)
+                if denoised_title_str != self.noisy_image_display_title:
+                    original_widget_info = next((w for w in self.result_widgets if w['title'] == self.noisy_image_display_title), None)
+                    if original_widget_info and original_widget_info['data'] is not None:
+                        # original_widget_info['data'] is already scaled if rescale_var is ON
+                        full_original_noisy_data = original_widget_info['data'] 
+
+                        if selected_region:
+                            dx0, dy0, dx1, dy1 = selected_region
+                            if dx1 <= full_original_noisy_data.shape[1] and dy1 <= full_original_noisy_data.shape[0] and \
+                               dx1 <= self.clean_image_data.shape[1] and dy1 <= self.clean_image_data.shape[0]:
+                                original_noisy_data_slice = full_original_noisy_data[dy0:dy1, dx0:dx1]
+                                raw_clean_slice_for_noisy_comp = self.clean_image_data[dy0:dy1, dx0:dx1]
+                            else: # Fallback for region mismatch
+                                original_noisy_data_slice = full_original_noisy_data
+                                raw_clean_slice_for_noisy_comp = self.clean_image_data
+                                print("Warning: Region mismatch for noisy vs. clean. Using full images.")
+                        else: # No region selected, use full images
+                            original_noisy_data_slice = full_original_noisy_data
+                            raw_clean_slice_for_noisy_comp = self.clean_image_data
+                        
+                        if original_noisy_data_slice.shape != raw_clean_slice_for_noisy_comp.shape:
+                            print(f"Shape mismatch: Noisy slice {original_noisy_data_slice.shape}, Clean slice for noisy {raw_clean_slice_for_noisy_comp.shape}. Using full images if possible.")
+                            original_noisy_data_slice = full_original_noisy_data
+                            raw_clean_slice_for_noisy_comp = self.clean_image_data
+                            if original_noisy_data_slice.shape != raw_clean_slice_for_noisy_comp.shape:
+                                print("Error: Cannot align noisy and clean image shapes for comparison. Skipping noisy comparison.")
+                                original_noisy_data_slice = None # Prevent comparison
+                                raw_clean_slice_for_noisy_comp = None
+
+                # --- Calculate Metrics using the single source of truth --- 
+                metrics_denoised_vs_clean = self.calculate_ground_truth_metrics(
+                    denoised_data_slice, 
+                    raw_clean_slice_for_denoised_comp
+                )
+
+                metrics_noisy_vs_clean = None
+                if original_noisy_data_slice is not None and raw_clean_slice_for_noisy_comp is not None:
+                    metrics_noisy_vs_clean = self.calculate_ground_truth_metrics(
+                        original_noisy_data_slice, # Already scaled if rescale_var is ON
+                        raw_clean_slice_for_noisy_comp # Always raw
+                    )
+                else:
+                    metrics_noisy_vs_clean = {} # Ensure it's a dict for the popup
+
+                # --- Calculate Actual Residual IMAGES for Display --- 
+                actual_denoised_residual = None
+                actual_noisy_residual = None
+                p1_val = getattr(self, 'p1', 0.0)
+                sf_val = getattr(self, 'scale_factor', 1.0)
+
+                if self.rescale_var.get() and sf_val > 1e-8:
+                    scaled_clean_for_den_display = (raw_clean_slice_for_denoised_comp - p1_val) / sf_val
+                    actual_denoised_residual = denoised_data_slice - scaled_clean_for_den_display
                     
-                    # [denoised - clean] calculation with proper scaling
-                    residual_data = metrics['scaled_residual']
-                    
-                    # Ensure metrics dictionary has all required fields
-                    if 'scaled_residual' not in metrics or residual_data is None:
-                        raise ValueError("Failed to calculate residual data")
-                    
-                    # Ensure basic statistics are included
-                    residual_flat = residual_data.ravel()
-                    metrics['mean'] = metrics.get('mean', np.mean(residual_flat))
-                    metrics['std'] = metrics.get('std', np.std(residual_flat))
-                    metrics['min'] = metrics.get('min', np.min(residual_flat))
-                    metrics['max'] = metrics.get('max', np.max(residual_flat))
-                    
-                    # Create title with metrics
-                    snr_text = f"SNR: {metrics['snr_db']:.2f}dB" if 'snr_db' in metrics and not np.isinf(metrics.get('snr_db', 0)) else "SNR: ∞dB"
-                    psnr_text = f"PSNR: {metrics['psnr']:.2f}dB" if 'psnr' in metrics and not np.isinf(metrics.get('psnr', 0)) else "PSNR: ∞dB"
-                    window_title = f"{denoised_title_str} Residuals (vs Clean){region_label} - {snr_text}, {psnr_text}"
-                    
-                    # Also prepare the "original" noisy image residual against clean reference
-                    noisy_residual = None
-                    noisy_metrics = None
-                    
-                    if denoised_title_str != self.noisy_image_display_title:
-                        original_widget_info = next((w for w in self.result_widgets if w['title'] == self.noisy_image_display_title), None)
-                        if original_widget_info and original_widget_info['data'] is not None:
-                            original_full = original_widget_info['data']
-                            if selected_region:
-                                dx0, dy0, dx1, dy1 = selected_region
-                                if (dx1 <= original_full.shape[1] and dy1 <= original_full.shape[0]):
-                                    original_data = original_full[dy0:dy1, dx0:dx1]
-                                else:
-                                    original_data = original_full
-                            else:
-                                original_data = original_full
-                            
-                            if original_data.shape == clean_data.shape:
-                                # Calculate residual and metrics for noisy image vs clean
-                                try:
-                                    noisy_metrics = self.calculate_ground_truth_metrics(original_data, clean_data)
-                                    noisy_residual = noisy_metrics.get('scaled_residual')
-                                    
-                                    # Ensure basic statistics for noisy residual
-                                    if noisy_residual is not None:
-                                        noisy_flat = noisy_residual.ravel()
-                                        noisy_metrics['mean'] = noisy_metrics.get('mean', np.mean(noisy_flat))
-                                        noisy_metrics['std'] = noisy_metrics.get('std', np.std(noisy_flat))
-                                        noisy_metrics['min'] = noisy_metrics.get('min', np.min(noisy_flat))
-                                        noisy_metrics['max'] = noisy_metrics.get('max', np.max(noisy_flat))
-                                except Exception as e:
-                                    print(f"Error calculating noisy metrics: {e}")
-                                    noisy_residual = None
-                                    noisy_metrics = None
-                    
-                    # Launch residual analysis popup with both denoised and noisy residuals
-                    ResidualAnalysisPopup(self, 
-                                        main_residual=residual_data, 
-                                        metrics=metrics,
-                                        comparison_residual=noisy_residual,
-                                        comparison_metrics=noisy_metrics,
-                                        main_title=f"{denoised_title_str} - Clean",
-                                        comparison_title=f"{self.noisy_image_display_title} - Clean",
-                                        window_title=window_title,
-                                        region_label=region_label)
-                except Exception as e:
-                    tkinter.messagebox.showerror("Calculation Error", f"Error calculating metrics: {str(e)}")
-                    print(f"Error in clean reference metrics: {e}")
+                    if original_noisy_data_slice is not None and raw_clean_slice_for_noisy_comp is not None:
+                        if raw_clean_slice_for_noisy_comp.shape == original_noisy_data_slice.shape:
+                             scaled_clean_for_noisy_display = (raw_clean_slice_for_noisy_comp - p1_val) / sf_val
+                             actual_noisy_residual = original_noisy_data_slice - scaled_clean_for_noisy_display
+                        else:
+                            print("WARNING: Noisy residual image for display cannot be computed due to shape mismatch after scaling attempt.")
+                            actual_noisy_residual = original_noisy_data_slice # Show original scaled noisy as fallback display
+                else: # Rescale OFF or bad scale_factor
+                    actual_denoised_residual = denoised_data_slice - raw_clean_slice_for_denoised_comp
+                    if original_noisy_data_slice is not None and raw_clean_slice_for_noisy_comp is not None:
+                         if raw_clean_slice_for_noisy_comp.shape == original_noisy_data_slice.shape:
+                            actual_noisy_residual = original_noisy_data_slice - raw_clean_slice_for_noisy_comp
+                         else:
+                            actual_noisy_residual = original_noisy_data_slice
+
+                if actual_denoised_residual is None:
+                    tkinter.messagebox.showerror("Calculation Error", "Failed to calculate main residual image for analysis.")
                     return
+                
+                # Prepare titles for popup
+                snr_text_main = "N/A"
+                if 'snr_db' in metrics_denoised_vs_clean and metrics_denoised_vs_clean['snr_db'] is not None:
+                    snr_val_main = "∞" if np.isinf(metrics_denoised_vs_clean['snr_db']) else f"{metrics_denoised_vs_clean['snr_db']:.2f}"
+                    snr_text_main = f"SNR: {snr_val_main}dB"
+
+                psnr_text_main = "N/A"
+                if 'psnr' in metrics_denoised_vs_clean and metrics_denoised_vs_clean['psnr'] is not None:
+                    psnr_val_main = "∞" if np.isinf(metrics_denoised_vs_clean['psnr']) else f"{metrics_denoised_vs_clean['psnr']:.2f}"
+                    psnr_text_main = f"PSNR: {psnr_val_main}dB"
+
+                window_title_base = f"{denoised_title_str} Residuals (vs Clean){region_label}"
+                window_title = f"{window_title_base} - {snr_text_main}, {psnr_text_main}"
+                
+                popup_main_title = f"{denoised_title_str} - Clean"
+                popup_comparison_title = None
+                if actual_noisy_residual is not None and metrics_noisy_vs_clean:
+                    popup_comparison_title = f"{self.noisy_image_display_title} - Clean"
+                
+                ResidualAnalysisPopup(self, 
+                                    main_residual=actual_denoised_residual, 
+                                    metrics=metrics_denoised_vs_clean, # This now comes from calculate_ground_truth_metrics
+                                    comparison_residual=actual_noisy_residual,
+                                    comparison_metrics=metrics_noisy_vs_clean, # This also from calculate_ground_truth_metrics
+                                    main_title=popup_main_title,
+                                    comparison_title=popup_comparison_title,
+                                    window_title=window_title,
+                                    region_label=region_label)
                 
             # === CASE 2: No clean reference (LBL/IMG pairs) ===
             else:
@@ -1676,19 +1813,23 @@ class DenoiseWindow(tk.Toplevel):
                     # Calculate statistics on the residual
                     try:
                         residual_flat = residual_data.ravel()
+                        current_mean = np.mean(residual_flat) # Calculate the mean
+                        current_std = np.std(residual_flat)
                         metrics = {
                             # Removed mean to avoid errors
-                            'std': np.std(residual_flat),
+                            'std': current_std,
                             'skew': skew(residual_flat, bias=False),
                             'kurt': kurtosis(residual_flat, fisher=False),
                             'min': np.min(residual_flat),
-                            'max': np.max(residual_flat)
+                            'max': np.max(residual_flat),
+                            'mean': current_mean # Store the mean as well
                         }
                         
                         # Kolmogorov-Smirnov test against normal distribution
-                        # Use 0 instead of mean for KS test
-                        std_for_kstest = metrics['std'] if metrics['std'] > 1e-12 else 1e-12  # Avoid division by zero
-                        _, metrics['pval'] = kstest((residual_flat) / std_for_kstest, 'norm')
+                        # Standardize the residual before testing
+                        std_for_kstest = current_std if current_std > 1e-12 else 1e-12  # Avoid division by zero
+                        standardized_residual = (residual_flat - current_mean) / std_for_kstest
+                        _, metrics['pval'] = kstest(standardized_residual, 'norm')
                         
                         # Add empty placeholders for GT metrics to avoid key errors
                         metrics['snr_db'] = None
@@ -1740,6 +1881,91 @@ class DenoiseWindow(tk.Toplevel):
             import traceback
             traceback.print_exc()
 
+    def show_nlm_processing_dialog(self):
+        self.nlm_progress_win = tk.Toplevel(self)
+        self.nlm_progress_win.title("NLM Processing")
+        # Adjust geometry for progress bar
+        self.nlm_progress_win.geometry("350x150") 
+        self.nlm_progress_win.transient(self) 
+        self.nlm_progress_win.grab_set() 
+        self.nlm_progress_win.protocol("WM_DELETE_WINDOW", lambda: None) 
+
+        progress_label = ttk.Label(self.nlm_progress_win, text="Processing Non-Local Means...\nThis may take some time.", justify=tk.CENTER)
+        progress_label.pack(pady=10, padx=20) # Adjusted padding
+
+        # Add Progress Bar
+        self.nlm_progress_var = tk.DoubleVar()
+        self.nlm_progressbar = ttk.Progressbar(self.nlm_progress_win, variable=self.nlm_progress_var, length=300, mode='determinate')
+        self.nlm_progressbar.pack(pady=10, padx=20)
+        
+        self.nlm_progress_win.update_idletasks()
+
+    def update_nlm_progress(self, percentage):
+        if hasattr(self, 'nlm_progress_var') and hasattr(self, 'nlm_progressbar') and self.nlm_progressbar.winfo_exists():
+            self.nlm_progress_var.set(percentage)
+            # self.nlm_progress_win.update_idletasks() # May not be needed if main loop is responsive
+
+    def check_nlm_result(self, display_data_original):
+        try:
+            # Non-blocking check of the queue
+            result_or_exc = self.nlm_result_queue.get_nowait()
+
+            # Close processing dialog
+            if hasattr(self, 'nlm_progress_win') and self.nlm_progress_win.winfo_exists():
+                self.nlm_progress_win.grab_release()
+                self.nlm_progress_win.destroy()
+                delattr(self, 'nlm_progress_win')
+
+            if isinstance(result_or_exc, Exception):
+                # Handle exception from the NLM thread
+                e = result_or_exc
+                print(f"NLM Denoise failed in thread: {e}")
+                import traceback
+                traceback.print_exc()
+                den_display = None 
+                self.show_result("NLM Denoise", den_display, display_data_original)
+                tkinter.messagebox.showerror("NLM Error", f"NLM processing failed: {str(e)}")
+            else:
+                # Process successful NLM result
+                den_scaled = result_or_exc
+                print("NLM Denoising complete from thread.")
+
+                # Maintain consistent scaling approach for display and metrics
+                if self.rescale_var.get():
+                    den_display = den_scaled 
+                    print(f"Keeping NLM output in [0,1] range: [{np.min(den_scaled):.4f}, {np.max(den_scaled):.4f}]")
+                else:
+                    den_display = den_scaled
+                    print(f"Using NLM output directly: [{np.min(den_scaled):.4f}, {np.max(den_scaled):.4f}]")
+                
+                self.show_result("NLM Denoise", den_display, display_data_original)
+            
+            # Update all metrics and plots now that NLM result (or failure) is processed
+            self.update_all_metrics()
+            # Update scrollregion as well, as a new panel might have been added
+            self.results_frame.update_idletasks()
+            required_width = self.results_frame.winfo_reqwidth()
+            required_height = self.results_frame.winfo_reqheight()
+            self.scrollable_canvas.config(scrollregion=(0, 0, required_width, required_height))
+            canvas_width = self.scrollable_canvas.winfo_width()
+            if required_width > canvas_width:
+                if not self.h_scrollbar.winfo_ismapped():
+                    self.h_scrollbar.pack(side='bottom', fill='x')
+            else:
+                if self.h_scrollbar.winfo_ismapped():
+                    self.h_scrollbar.pack_forget()
+
+        except queue.Empty:
+            # Queue is empty, NLM still processing, reschedule check
+            self.after(100, self.check_nlm_result, display_data_original)
+        except Exception as e_check:
+            # Catch any other unexpected error in this checker function itself
+            print(f"Error in NLM result checker: {e_check}")
+            if hasattr(self, 'nlm_progress_win') and self.nlm_progress_win.winfo_exists():
+                self.nlm_progress_win.grab_release()
+                self.nlm_progress_win.destroy()
+            tkinter.messagebox.showerror("NLM Check Error", f"Error processing NLM result: {str(e_check)}")
+
 
 class ResidualAnalysisPopup(tk.Toplevel):
     """
@@ -1771,6 +1997,15 @@ class ResidualAnalysisPopup(tk.Toplevel):
         self.main_title = main_title
         self.comparison_title = comparison_title
         self.region_label = region_label
+        self.denoise_window = master # Store reference to DenoiseWindow
+
+        # Determine the display scale factor
+        self.display_scale_factor = 1.0
+        if self.denoise_window.rescale_var.get(): # Check if the checkbox was on
+            if hasattr(self.denoise_window, 'scale_factor') and self.denoise_window.scale_factor > 1e-8:
+                # self.denoise_window.scale_factor is set to 1.0 in apply_denoise if rescale_var is false.
+                # If rescale_var is true, self.denoise_window.scale_factor should be the actual factor.
+                self.display_scale_factor = self.denoise_window.scale_factor
         
         # Ensure basic statistics are included
         if main_residual is not None:
@@ -1782,9 +2017,10 @@ class ResidualAnalysisPopup(tk.Toplevel):
                 self.metrics['max'] = self.metrics.get('max', np.max(residual_flat))
                 # Compute Kolmogorov-Smirnov test if missing
                 if 'pval' not in self.metrics:
-                    std_for_kstest = self.metrics['std'] if self.metrics['std'] > 1e-12 else 1e-12
-                    # Use zero instead of mean
-                    _, self.metrics['pval'] = kstest(residual_flat / std_for_kstest, 'norm')
+                    current_mean_main = np.mean(residual_flat) # Calculate mean
+                    std_for_kstest_main = self.metrics['std'] if self.metrics['std'] > 1e-12 else 1e-12
+                    standardized_residual_main = (residual_flat - current_mean_main) / std_for_kstest_main # Standardize
+                    _, self.metrics['pval'] = kstest(standardized_residual_main, 'norm')
                 # Compute skewness and kurtosis if missing
                 if 'skew' not in self.metrics:
                     self.metrics['skew'] = skew(residual_flat, bias=False)
@@ -1810,9 +2046,10 @@ class ResidualAnalysisPopup(tk.Toplevel):
                 self.comparison_metrics['max'] = self.comparison_metrics.get('max', np.max(comp_flat))
                 # Compute Kolmogorov-Smirnov test if missing
                 if 'pval' not in self.comparison_metrics:
-                    std_for_kstest = self.comparison_metrics['std'] if self.comparison_metrics['std'] > 1e-12 else 1e-12
-                    # Use zero instead of mean 
-                    _, self.comparison_metrics['pval'] = kstest(comp_flat / std_for_kstest, 'norm')
+                    current_mean_comp = np.mean(comp_flat) # Calculate mean
+                    std_for_kstest_comp = self.comparison_metrics['std'] if self.comparison_metrics['std'] > 1e-12 else 1e-12
+                    standardized_residual_comp = (comp_flat - current_mean_comp) / std_for_kstest_comp # Standardize
+                    _, self.comparison_metrics['pval'] = kstest(standardized_residual_comp, 'norm')
                 # Compute skewness and kurtosis if missing
                 if 'skew' not in self.comparison_metrics:
                     self.comparison_metrics['skew'] = skew(comp_flat, bias=False)
@@ -1867,21 +2104,26 @@ class ResidualAnalysisPopup(tk.Toplevel):
                 font=('Helvetica', 10, 'bold')).pack(anchor='w')
         
         # Basic statistics
+        scaled_std_main = metrics.get('std', 0.0)
+        unscaled_std_main = scaled_std_main * self.display_scale_factor
+        
         basic_stats_str = (
-            # Removed mean from display
-            f"Std Dev: {metrics['std']:.4e}\n"
-            f"Skewness: {metrics['skew']:.4f}\n"
-            f"Kurtosis: {metrics['kurt']:.4f}\n"
-            f"KS p-value: {metrics['pval']:.4g}"
+            f"Std Dev: {unscaled_std_main:.4e}\n"
+            f"Skewness: {metrics.get('skew', 0.0):.4f}\n"
+            f"Kurtosis: {metrics.get('kurt', 0.0):.4f}\n"
+            f"KS p-value: {metrics.get('pval', 0.5):.4g}"
         )
         
         # Add SNR/PSNR if available
         if 'snr_db' in metrics and metrics['snr_db'] is not None and 'psnr' in metrics and metrics['psnr'] is not None:
             snr_val = "∞" if np.isinf(metrics['snr_db']) else f"{metrics['snr_db']:.2f}"
             psnr_val = "∞" if np.isinf(metrics['psnr']) else f"{metrics['psnr']:.2f}"
-            rmse_val = f"{metrics['rmse']:.4e}" if 'rmse' in metrics and metrics['rmse'] is not None else "N/A"
             
-            basic_stats_str += f"\nSNR: {snr_val} dB\nPSNR: {psnr_val} dB\nRMSE: {rmse_val}"
+            scaled_rmse_main = metrics.get('rmse', 0.0)
+            unscaled_rmse_main = scaled_rmse_main * self.display_scale_factor
+            rmse_val_str = f"{unscaled_rmse_main:.4e}" if metrics.get('rmse') is not None else "N/A"
+            
+            basic_stats_str += f"\nSNR: {snr_val} dB\nPSNR: {psnr_val} dB\nRMSE: {rmse_val_str}"
         
         ttk.Label(main_stats_frame, text=basic_stats_str, justify='left').pack(anchor='w', pady=5)
         
@@ -1893,9 +2135,11 @@ class ResidualAnalysisPopup(tk.Toplevel):
             ttk.Label(comp_stats_frame, text=f"{comparison_title} Statistics:", 
                     font=('Helvetica', 10, 'bold')).pack(anchor='w')
             
+            scaled_std_comp = comparison_metrics.get('std', 0.0)
+            unscaled_std_comp = scaled_std_comp * self.display_scale_factor
+
             comp_stats_str = (
-                # Removed mean from display
-                f"Std Dev: {comparison_metrics.get('std', 0.0):.4e}\n"
+                f"Std Dev: {unscaled_std_comp:.4e}\n"
                 f"Skewness: {comparison_metrics.get('skew', 0.0):.4f}\n"
                 f"Kurtosis: {comparison_metrics.get('kurt', 0.0):.4f}\n"
                 f"KS p-value: {comparison_metrics.get('pval', 0.5):.4g}"
@@ -1906,9 +2150,12 @@ class ResidualAnalysisPopup(tk.Toplevel):
                 'psnr' in comparison_metrics and comparison_metrics['psnr'] is not None):
                 snr_val = "∞" if np.isinf(comparison_metrics['snr_db']) else f"{comparison_metrics['snr_db']:.2f}"
                 psnr_val = "∞" if np.isinf(comparison_metrics['psnr']) else f"{comparison_metrics['psnr']:.2f}"
-                rmse_val = f"{comparison_metrics['rmse']:.4e}" if 'rmse' in comparison_metrics and comparison_metrics['rmse'] is not None else "N/A"
+
+                scaled_rmse_comp = comparison_metrics.get('rmse', 0.0)
+                unscaled_rmse_comp = scaled_rmse_comp * self.display_scale_factor
+                rmse_val_str_comp = f"{unscaled_rmse_comp:.4e}" if comparison_metrics.get('rmse') is not None else "N/A"
                 
-                comp_stats_str += f"\nSNR: {snr_val} dB\nPSNR: {psnr_val} dB\nRMSE: {rmse_val}"
+                comp_stats_str += f"\nSNR: {snr_val} dB\nPSNR: {psnr_val} dB\nRMSE: {rmse_val_str_comp}"
             
             ttk.Label(comp_stats_frame, text=comp_stats_str, justify='left').pack(anchor='w', pady=5)
         

@@ -27,6 +27,43 @@ def load_reference_histogram():
         return None
 
 
+def histogram_matching(source_image, reference_patches):
+    """
+    Match the histogram of a source image to a reference distribution derived from patches.
+    
+    Parameters:
+        source_image (ndarray): Source image to transform
+        reference_patches (ndarray): Array of reference patches or values 
+        
+    Returns:
+        ndarray: Image with histogram matched to reference distribution
+    """
+    # Flatten source image for histogram computation
+    src_flat = source_image.flatten()
+    
+    # Flatten reference patches into a single array of values
+    ref_flat = reference_patches.flatten()
+    
+    # Get the sorted unique values and their indices
+    src_values, src_indices = np.unique(src_flat, return_inverse=True)
+    
+    # Calculate the normalized cumulative histograms
+    src_quantiles = np.zeros(len(src_values))
+    for i in range(len(src_values)):
+        src_quantiles[i] = np.sum(src_flat <= src_values[i]) / len(src_flat)
+    
+    # Create a mapping from source to reference quantiles
+    interp_values = np.interp(src_quantiles, 
+                             np.linspace(0, 1, len(ref_flat)),
+                             np.sort(ref_flat))
+    
+    # Map each pixel in source image
+    matched_flat = interp_values[src_indices]
+    
+    # Reshape back to original image dimensions
+    return matched_flat.reshape(source_image.shape)
+
+
 def downscale_image(image, bin_size=5):
     """
     Downscale an image using bin averaging.
@@ -189,6 +226,104 @@ def save_image_pair(clean, noisy, output_dir, index):
     plt.close()
 
 
+def load_real_image_patches(csv_path="noise_characterization_patch_logs.csv", data_dir="data"):
+    """
+    Load patches from real Cassini images for histogram reference.
+    
+    Parameters:
+        csv_path (str): Path to the CSV file with patch coordinates
+        data_dir (str): Directory containing the Cassini data
+        
+    Returns:
+        list: List of image patches from real Cassini images
+    """
+    from pds import parse_header, read_image
+    
+    patches = []
+    
+    try:
+        # Read the CSV file
+        import csv
+        with open(csv_path, 'r') as csvfile:
+            reader = csv.DictReader(csvfile)
+            
+            for row in reader:
+                filename = row['filename']
+                
+                # Extract patch coordinates
+                coords = (
+                    int(row['orig_x0']),
+                    int(row['orig_x1']),
+                    int(row['orig_y0']),
+                    int(row['orig_y1'])
+                )
+                
+                # Find the actual image file
+                header_path, img_path = find_image_file(filename, data_dir)
+                
+                if header_path and img_path:
+                    try:
+                        # Load the image
+                        image = read_image(header_file_path=header_path, image_file_path=img_path, keep_float=True)
+                        
+                        # Extract the patch
+                        x0, x1, y0, y1 = coords
+                        patch = image[y0:y1, x0:x1]
+                        
+                        # Add to patches list
+                        patches.append(patch)
+                    except Exception as e:
+                        print(f"Error loading patch from {filename}: {e}")
+            
+    except Exception as e:
+        print(f"Error loading real image patches: {e}")
+    
+    return patches
+
+
+def find_image_file(filename, data_dir="data"):
+    """
+    Find an image file (LBL or IMG) in the data directory structure.
+    
+    Parameters:
+        filename (str): Filename pattern to search for
+        data_dir (str): Base directory to search in
+        
+    Returns:
+        tuple: (header_path, image_path) or (None, None) if not found
+    """
+    # Extract base name without extension (in case input has extension)
+    base_name = os.path.splitext(os.path.basename(filename))[0]
+    
+    # First, try to find the LBL file
+    lbl_patterns = [
+        f"**/{base_name}*.LBL",  # Label files with any suffix
+        f"**/{base_name}_CALIB.LBL"   # Calibrated label files
+    ]
+    
+    header_path = None
+    for pattern in lbl_patterns:
+        matches = list(Path(data_dir).glob(pattern))
+        if matches:
+            header_path = str(matches[0])
+            break
+    
+    if not header_path:
+        return None, None
+    
+    # Now find the corresponding IMG file
+    base_img_path = os.path.splitext(header_path)[0]
+    image_path = f"{base_img_path}.IMG"
+    
+    # Check if file exists (case sensitive)
+    if not os.path.exists(image_path):
+        image_path = f"{base_img_path}.img"  # Try lowercase extension
+        if not os.path.exists(image_path):
+            return header_path, None  # LBL found but IMG not found
+    
+    return header_path, image_path
+
+
 def process_simulation(input_path, output_dir, bin_size=5, section_size=100, stride=50, noise_std=0.001224):
     """
     Process a simulation image according to the adaptation pipeline.
@@ -201,17 +336,22 @@ def process_simulation(input_path, output_dir, bin_size=5, section_size=100, str
         stride (int): Stride between sections
         noise_std (float): Noise standard deviation
     """
-    # 1. Load the reference histogram
-    ref_histogram = load_reference_histogram()
-    if ref_histogram is None:
-        print("Cannot proceed without reference histogram.")
-        return
-    
-    # Calculate target contrast as the median of RMS contrast values
-    target_contrast = np.median(ref_histogram['rms_contrast'])
+    # Use mean RMS contrast from contrast_analysis.py
+    target_contrast = 0.060011  # Mean RMS contrast from contrast_analysis.py
     print(f"Target RMS contrast: {target_contrast:.6f}")
     
-    # 2. Load the simulation image
+    # 2. Load real image patches for histogram matching
+    print("Loading real image patches for histogram matching...")
+    real_patches = load_real_image_patches()
+    if not real_patches:
+        print("Warning: No real image patches loaded for histogram matching.")
+        real_patches = None
+    else:
+        # Combine all patches into a single array for histogram reference
+        real_patches_array = np.concatenate([patch.flatten() for patch in real_patches])
+        print(f"Loaded {len(real_patches)} patches, total of {len(real_patches_array)} pixels")
+    
+    # 3. Load the simulation image
     try:
         raw_image = np.array(Image.open(input_path).convert('F'))
     except Exception as e:
@@ -220,23 +360,30 @@ def process_simulation(input_path, output_dir, bin_size=5, section_size=100, str
     
     print(f"Loaded image with shape: {raw_image.shape}")
     
-    # 3. Downscale the image
+    # 4. Downscale the image
     print(f"Downscaling with bin size {bin_size}...")
     downscaled = downscale_image(raw_image, bin_size)
     print(f"Downscaled image shape: {downscaled.shape}")
     
-    # 4. Extract sections
+    # 5. Extract sections
     print(f"Extracting {section_size}x{section_size} sections with stride {stride}...")
     sections = extract_sections(downscaled, section_size, stride)
     print(f"Extracted {len(sections)} sections")
     
-    # 5. Process each section
+    # 6. Process each section
     for i, (section, coords) in enumerate(sections):
         print(f"Processing section {i+1}/{len(sections)} at coordinates {coords}...")
         
+        # Match histogram if we have real patches
+        if real_patches_array is not None:
+            print("  Matching histogram...")
+            histogram_matched = histogram_matching(section, real_patches_array)
+        else:
+            histogram_matched = section
+        
         # Match contrast
         print("  Matching contrast...")
-        contrast_matched = match_contrast(section, target_contrast)
+        contrast_matched = match_contrast(histogram_matched, target_contrast)
         
         # Add noise
         print("  Adding noise...")
