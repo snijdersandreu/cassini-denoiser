@@ -207,20 +207,19 @@ def save_image_pair(clean, noisy, output_dir, index):
     )
     
     # Save as PNG for visualization
-    plt.figure(figsize=(20, 10))
-    
-    # Display clean image
-    plt.subplot(1, 2, 1)
+    plt.figure(figsize=(10, 20)) # Changed figure size for vertical layout
+    # Display clean image (top)
+    plt.subplot(2, 1, 1)
     plt.imshow(clean, cmap='gray')
     plt.title('Clean Image')
     plt.axis('off')
-    
-    # Display noisy image
-    plt.subplot(1, 2, 2)
+    # Display noisy image (bottom)
+    plt.subplot(2, 1, 2)
     plt.imshow(noisy, cmap='gray')
     plt.title('Noisy Image')
     plt.axis('off')
-    
+    # Reduce space between subplots
+    plt.subplots_adjust(hspace=0.05)
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, f'pair_{index:03d}.png'), dpi=150)
     plt.close()
@@ -324,7 +323,7 @@ def find_image_file(filename, data_dir="data"):
     return header_path, image_path
 
 
-def process_simulation(input_path, output_dir, bin_size=5, section_size=100, stride=50, noise_std=0.001224):
+def process_simulation(input_path, output_dir, bin_size=5, noise_std=0.001224):
     """
     Process a simulation image according to the adaptation pipeline.
     
@@ -332,8 +331,6 @@ def process_simulation(input_path, output_dir, bin_size=5, section_size=100, str
         input_path (str): Path to the input simulation image
         output_dir (str): Output directory for processed image pairs
         bin_size (int): Size of bins for downscaling
-        section_size (int): Size of image sections for extraction
-        stride (int): Stride between sections
         noise_std (float): Noise standard deviation
     """
     # Use mean RMS contrast from contrast_analysis.py
@@ -343,13 +340,13 @@ def process_simulation(input_path, output_dir, bin_size=5, section_size=100, str
     # 2. Load real image patches for histogram matching
     print("Loading real image patches for histogram matching...")
     real_patches = load_real_image_patches()
+    real_patches_array = None # Initialize to None
     if not real_patches:
         print("Warning: No real image patches loaded for histogram matching.")
-        real_patches = None
     else:
         # Combine all patches into a single array for histogram reference
         real_patches_array = np.concatenate([patch.flatten() for patch in real_patches])
-        print(f"Loaded {len(real_patches)} patches, total of {len(real_patches_array)} pixels")
+        print(f"Loaded {len(real_patches)} patches, total of {len(real_patches_array)} pixels for histogram reference.")
     
     # 3. Load the simulation image
     try:
@@ -362,63 +359,75 @@ def process_simulation(input_path, output_dir, bin_size=5, section_size=100, str
     
     # 4. Downscale the image
     print(f"Downscaling with bin size {bin_size}...")
-    downscaled = downscale_image(raw_image, bin_size)
-    print(f"Downscaled image shape: {downscaled.shape}")
+    downscaled_image = downscale_image(raw_image, bin_size)
+    print(f"Downscaled image shape: {downscaled_image.shape}")
     
-    # 5. Extract sections
-    print(f"Extracting {section_size}x{section_size} sections with stride {stride}...")
-    sections = extract_sections(downscaled, section_size, stride)
-    print(f"Extracted {len(sections)} sections")
+    # 5. Process the full downscaled image
+    print("Processing full downscaled image...")
     
-    # 6. Process each section
-    for i, (section, coords) in enumerate(sections):
-        print(f"Processing section {i+1}/{len(sections)} at coordinates {coords}...")
-        
-        # Match histogram if we have real patches
-        if real_patches_array is not None:
-            print("  Matching histogram...")
-            histogram_matched = histogram_matching(section, real_patches_array)
-        else:
-            histogram_matched = section
-        
-        # Match contrast
-        print("  Matching contrast...")
-        contrast_matched = match_contrast(histogram_matched, target_contrast)
-        
-        # Add noise
-        print("  Adding noise...")
-        noisy_section, clean_section = add_gaussian_noise(contrast_matched, noise_std)
-        
-        # Save the pair
-        save_image_pair(clean_section, noisy_section, output_dir, i)
+    processed_image = downscaled_image
     
-    print(f"All sections processed and saved to {output_dir}")
+    # Match histogram if we have real patches
+    if real_patches_array is not None:
+        print("  Matching histogram...")
+        processed_image = histogram_matching(processed_image, real_patches_array)
+    
+    # Match contrast
+    print("  Matching contrast...")
+    contrast_matched_image = match_contrast(processed_image, target_contrast)
+    
+    # Add noise
+    print("  Adding noise...")
+    noisy_image, clean_image = add_gaussian_noise(contrast_matched_image, noise_std)
+    
+    # Save the pair
+    # Use a fixed index or derive from filename if multiple inputs are processed later
+    # For now, using index 0 as main calls this once.
+    base_filename = os.path.splitext(os.path.basename(input_path))[0]
+    output_pair_filename = f"{base_filename}_adapted" 
+
+    # Modify save_image_pair to accept a base filename instead of an index for clarity
+    # Or, ensure the output_dir makes it unique if multiple simulations are run.
+    # For now, we will save with a generic name "full_adapted_pair" and index 0.
+    # If you plan to process multiple simulation images, this naming needs to be more dynamic.
+    
+    print(f"Saving processed image pair...")
+    # Save the pair using index 0, assuming one main image processed by this script run
+    save_image_pair(clean_image, noisy_image, output_dir, 0) 
+    
+    print(f"Full image processed and saved to {output_dir}")
 
 
 def main():
     # Input and output paths
     input_path = os.path.join("StormAlley", "raw_pvort.png")
-    output_dir = "simulation_dataset"
+    output_dir = "simulation_dataset_full" # Changed output directory to avoid overwriting sectioned data
     
     # Process parameters
     bin_size = 5
-    section_size = 100  # Smaller section size to fit downscaled dimensions
-    stride = 50  # Smaller stride for more sections
+    # section_size = 100  # Smaller section size to fit downscaled dimensions - REMOVED
+    # stride = 50  # Smaller stride for more sections - REMOVED
     noise_std = 0.001224
     
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+
     # Run the processing pipeline
-    process_simulation(input_path, output_dir, bin_size, section_size, stride, noise_std)
+    process_simulation(input_path, output_dir, bin_size, noise_std)
     
     print("\nSummary of dataset creation:")
     print("----------------------------")
     print(f"Source image: {input_path}")
+    print(f"Output directory: {output_dir}")
     print(f"Downscale bin size: {bin_size}x{bin_size}")
-    print(f"Section size: {section_size}x{section_size}")
-    print(f"Section stride: {stride}")
+    # print(f"Section size: {section_size}x{section_size}") # REMOVED
+    # print(f"Section stride: {stride}") # REMOVED
     print(f"Noise standard deviation: {noise_std}")
     
     # Count the generated pairs
-    num_pairs = len(glob.glob(os.path.join(output_dir, "pair_*.npz")))
+    # This will count pair_000.npz, pair_001.npz etc. We are saving only one with index 0.
+    # Adjust if naming convention in save_image_pair changes.
+    num_pairs = len(glob.glob(os.path.join(output_dir, "pair_000.npz"))) 
     print(f"Total image pairs generated: {num_pairs}")
 
 
