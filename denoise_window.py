@@ -8,7 +8,7 @@ from scipy.signal import wiener
 import noise_analysis
 from denoising_algorithms import starlet
 from denoising_algorithms import bm3d
-from denoising_algorithms import unet_self2self
+from denoising_algorithms import total_variation
 from denoising_algorithms import wiener as custom_wiener
 from denoising_algorithms import nlm_denoising # Add NLM import
 from matplotlib.figure import Figure
@@ -172,12 +172,37 @@ class DenoiseWindow(tk.Toplevel):
         self.bm3d_threshold_var = tk.StringVar(value="2.7")
         ttk.Entry(bm3d_params_frame, textvariable=self.bm3d_threshold_var, width=8).grid(row=3, column=1, padx=5)
 
-        self.unet_var = tk.BooleanVar(value=False)
+        self.tv_var = tk.BooleanVar(value=False)
+        tv_frame = ttk.Frame(self.control_frame)
+        tv_frame.pack(fill='x', padx=10, pady=5)
+
         ttk.Checkbutton(
-            self.control_frame,
-            text="UNET-Self2Self",
-            variable=self.unet_var
-        ).pack(anchor="w", padx=10, pady=5)
+            tv_frame,
+            text="Total Variation",
+            variable=self.tv_var
+        ).pack(anchor="w")
+
+        # Add parameters for Total Variation
+        tv_params_frame = ttk.Frame(tv_frame)
+        tv_params_frame.pack(fill='x', padx=20, pady=2)
+
+        # Weight (regularization parameter)
+        ttk.Label(tv_params_frame, text="Weight:").grid(row=0, column=0, sticky="w")
+        self.tv_weight_var = tk.StringVar(value="0.1")
+        ttk.Entry(tv_params_frame, textvariable=self.tv_weight_var, width=8).grid(row=0, column=1, padx=5)
+
+        # Method selection
+        ttk.Label(tv_params_frame, text="Method:").grid(row=1, column=0, sticky="w")
+        self.tv_method_var = tk.StringVar(value="chambolle")
+        method_combo = ttk.Combobox(tv_params_frame, textvariable=self.tv_method_var, width=10)
+        method_combo['values'] = ('chambolle', 'rof', 'bregman')
+        method_combo.grid(row=1, column=1, padx=5)
+        method_combo.state(['readonly'])
+
+        # Max iterations
+        ttk.Label(tv_params_frame, text="Max iter:").grid(row=2, column=0, sticky="w")
+        self.tv_max_iter_var = tk.StringVar(value="200")
+        ttk.Entry(tv_params_frame, textvariable=self.tv_max_iter_var, width=8).grid(row=2, column=1, padx=5)
 
         # NLM Denoising
         self.nlm_var = tk.BooleanVar(value=False)
@@ -208,7 +233,7 @@ class DenoiseWindow(tk.Toplevel):
         rescale_frame = ttk.LabelFrame(self.control_frame, text="Image Rescaling")
         rescale_frame.pack(fill='x', padx=10, pady=10)
 
-        self.rescale_var = tk.BooleanVar(value=True)
+        self.rescale_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             rescale_frame,
             text="Rescale Images Before Denoising",
@@ -399,7 +424,7 @@ class DenoiseWindow(tk.Toplevel):
         # Add labels for single-value metrics
         metrics_frame = ttk.Frame(info_frame)
         metrics_frame.pack(fill='x', pady=(5, 0))
-        snr_psd_label = ttk.Label(metrics_frame, text="SNR (PSD): Calc...", font=('Helvetica', 9))
+        snr_psd_label = ttk.Label(metrics_frame, text="SNR - PSD (estimation): Calc...", font=('Helvetica', 9))
         snr_psd_label.pack(side='left', padx=(0, 10))
         
         # Create a separate frame for the ground truth metrics if available
@@ -414,19 +439,30 @@ class DenoiseWindow(tk.Toplevel):
             gt_metrics_frame = ttk.LabelFrame(info_frame, text="Ground Truth Metrics")
             gt_metrics_frame.pack(fill='x', pady=(5, 5))
             
-            # Add labels for ground truth metrics
-            gt_snr_label = ttk.Label(gt_metrics_frame, text="SNR: Calc...", font=('Helvetica', 9))
-            gt_snr_label.pack(side='left', padx=(5, 10))
+            # First row: SNR metrics
+            snr_row = ttk.Frame(gt_metrics_frame)
+            snr_row.pack(fill='x', padx=5, pady=2)
             
-            gt_psnr_label = ttk.Label(gt_metrics_frame, text="PSNR: Calc...", font=('Helvetica', 9)) 
+            gt_snr_label = ttk.Label(snr_row, text="SNR - pixelwise: Calc...", font=('Helvetica', 9))
+            gt_snr_label.pack(side='left', padx=(0, 10))
+            
+            gt_psd_snr_label = ttk.Label(snr_row, text="SNR - PSD: Calc...", font=('Helvetica', 9))
+            gt_psd_snr_label.pack(side='left', padx=(0, 10))
+            
+            # Second row: Other metrics
+            other_row = ttk.Frame(gt_metrics_frame)
+            other_row.pack(fill='x', padx=5, pady=2)
+            
+            gt_psnr_label = ttk.Label(other_row, text="PSNR: Calc...", font=('Helvetica', 9)) 
             gt_psnr_label.pack(side='left', padx=(0, 10))
             
-            gt_rmse_label = ttk.Label(gt_metrics_frame, text="RMSE: Calc...", font=('Helvetica', 9))
+            gt_rmse_label = ttk.Label(other_row, text="RMSE: Calc...", font=('Helvetica', 9))
             gt_rmse_label.pack(side='left', padx=(0, 10))
         else:
             # Create dummy labels if GT metrics are not applicable, to maintain widget_info structure
             # These will be parented to metrics_frame and likely have empty text from update_psd_display
             gt_snr_label = ttk.Label(metrics_frame, text="") 
+            gt_psd_snr_label = ttk.Label(metrics_frame, text="")
             gt_psnr_label = ttk.Label(metrics_frame, text="")
             gt_rmse_label = ttk.Label(metrics_frame, text="")
             # gt_metrics_frame remains None
@@ -467,7 +503,7 @@ class DenoiseWindow(tk.Toplevel):
                 'hist_widget': hist_widget,
                 'psd_fig': psd_fig, 'psd_ax': psd_ax, 'psd_canvas': psd_canvas,
                 'snr_psd_label': snr_psd_label,
-                'gt_snr_label': gt_snr_label, 'gt_rmse_label': gt_rmse_label, 'gt_psnr_label': gt_psnr_label,
+                'gt_snr_label': gt_snr_label, 'gt_psd_snr_label': gt_psd_snr_label, 'gt_rmse_label': gt_rmse_label, 'gt_psnr_label': gt_psnr_label,
                 'gt_metrics_frame': gt_metrics_frame
             }
             self.result_widgets.append(widget_info)
@@ -494,7 +530,7 @@ class DenoiseWindow(tk.Toplevel):
             'hist_widget': hist_widget,
             'psd_fig': psd_fig, 'psd_ax': psd_ax, 'psd_canvas': psd_canvas,
             'snr_psd_label': snr_psd_label,
-            'gt_snr_label': gt_snr_label, 'gt_rmse_label': gt_rmse_label, 'gt_psnr_label': gt_psnr_label,
+            'gt_snr_label': gt_snr_label, 'gt_psd_snr_label': gt_psd_snr_label, 'gt_rmse_label': gt_rmse_label, 'gt_psnr_label': gt_psnr_label,
             'gt_metrics_frame': gt_metrics_frame
         }
         self.result_widgets.append(widget_info)
@@ -775,26 +811,39 @@ class DenoiseWindow(tk.Toplevel):
                 # Show error message
                 tkinter.messagebox.showerror("BM3D Error", f"BM3D processing failed: {str(e)}")
             
-        if self.unet_var.get():
+        if self.tv_var.get():
             try:
-                # Apply UNET to the *potentially scaled* data 'arr'
-                den_scaled = unet_self2self.unet_self2self_denoise(arr) 
+                # Parse Total Variation parameters
+                try:
+                    weight = float(self.tv_weight_var.get())
+                    method = self.tv_method_var.get()
+                    max_iter = int(self.tv_max_iter_var.get())
+                except ValueError:
+                    weight = 0.1
+                    method = 'chambolle'
+                    max_iter = 200
+                    print("Using default Total Variation parameters due to invalid input")
+                
+                # Apply Total Variation to the *potentially scaled* data 'arr'
+                den_scaled = total_variation.tv_denoise(arr, weight=weight, method=method, max_iter=max_iter)
                 
                 # Maintain consistent scaling approach
                 if self.rescale_var.get():
                     # Keep in [0,1] range for consistent metrics
                     den_display = den_scaled
-                    print(f"Keeping UNET output in [0,1] range: [{np.min(den_scaled):.4f}, {np.max(den_scaled):.4f}]")
+                    print(f"Keeping Total Variation output in [0,1] range: [{np.min(den_scaled):.4f}, {np.max(den_scaled):.4f}]")
                 else:
                     # No rescaling applied, use as is
                     den_display = den_scaled
-                    print(f"Using UNET output directly: [{np.min(den_scaled):.4f}, {np.max(den_scaled):.4f}]")
+                    print(f"Using Total Variation output directly: [{np.min(den_scaled):.4f}, {np.max(den_scaled):.4f}]")
                     
-                self.show_result("UNET-Self2Self", den_display, display_data_original)
+                self.show_result("Total Variation", den_display, display_data_original)
             except Exception as e:
-                print(f"UNET-Self2Self failed: {e}")
+                print(f"Total Variation failed: {e}")
+                import traceback
+                traceback.print_exc()
                 den = None
-                self.show_result("UNET-Self2Self", den, display_data_original)
+                self.show_result("Total Variation", den, display_data_original)
 
         if self.nlm_var.get():
             # Parse NLM parameters (synchronous part)
@@ -1151,6 +1200,7 @@ class DenoiseWindow(tk.Toplevel):
         hist_container = hist_widget.master # Assuming hist is always present
         snr_psd_label = widget_info['snr_psd_label']
         gt_snr_label = widget_info['gt_snr_label']
+        gt_psd_snr_label = widget_info['gt_psd_snr_label']
         gt_rmse_label = widget_info['gt_rmse_label']
         gt_psnr_label = widget_info['gt_psnr_label']
         gt_metrics_frame = widget_info.get('gt_metrics_frame')
@@ -1164,9 +1214,11 @@ class DenoiseWindow(tk.Toplevel):
             except tk.TclError: pass # Handle if canvas is destroyed
 
             # Update metric labels for no data
-            snr_psd_label.config(text="SNR (PSD): N/A")
+            snr_psd_label.config(text="SNR - PSD (estimation): N/A")
             if hasattr(gt_snr_label, 'winfo_ismapped') and gt_snr_label.winfo_ismapped():
-                gt_snr_label.config(text="SNR: N/A")
+                gt_snr_label.config(text="SNR - pixelwise: N/A")
+            if hasattr(gt_psd_snr_label, 'winfo_ismapped') and gt_psd_snr_label.winfo_ismapped():
+                gt_psd_snr_label.config(text="SNR - PSD: N/A")
             if hasattr(gt_rmse_label, 'winfo_ismapped') and gt_rmse_label.winfo_ismapped():
                 gt_rmse_label.config(text="RMSE: N/A")
             if hasattr(gt_psnr_label, 'winfo_ismapped') and gt_psnr_label.winfo_ismapped():
@@ -1229,12 +1281,12 @@ class DenoiseWindow(tk.Toplevel):
         try:
             snr_metrics = noise_analysis.estimate_snr_psd(data_slice)
             if snr_metrics and snr_metrics['snr_db'] is not None and not np.isnan(snr_metrics['snr_db']):
-                snr_psd_label.config(text=f"SNR (PSD): {snr_metrics['snr_db']:.2f} dB")
+                snr_psd_label.config(text=f"SNR - PSD (estimation): {snr_metrics['snr_db']:.2f} dB")
             else:
-                snr_psd_label.config(text="SNR (PSD): N/A")
+                snr_psd_label.config(text="SNR - PSD (estimation): N/A")
         except Exception as e:
             print(f"Error calculating PSD SNR for {title}{region_label_psd}: {e}")
-            snr_psd_label.config(text="SNR (PSD): Error")
+            snr_psd_label.config(text="SNR - PSD (estimation): Error")
             
         # Calculate ground truth metrics if clean image is available and this is a denoised result
         if self.clean_image_data is not None and gt_metrics_frame:
@@ -1266,14 +1318,23 @@ class DenoiseWindow(tk.Toplevel):
                 print(f"Calculated metrics - SNR: {gt_metrics['snr_db']}, PSNR: {gt_metrics['psnr']}, RMSE: {gt_metrics['rmse']}")
                 print("=== END DEBUG ===\n")
                 
-                # Update SNR label
+                # Update SNR label (spatial domain)
                 if gt_metrics['snr_db'] is not None and not np.isnan(gt_metrics['snr_db']):
                     if np.isinf(gt_metrics['snr_db']):
-                        gt_snr_label.config(text=f"SNR: \u221E dB")  # Unicode infinity symbol
+                        gt_snr_label.config(text=f"SNR - pixelwise: \u221E dB")  # Unicode infinity symbol
                     else:
-                        gt_snr_label.config(text=f"SNR: {gt_metrics['snr_db']:.2f} dB")
+                        gt_snr_label.config(text=f"SNR - pixelwise: {gt_metrics['snr_db']:.2f} dB")
                 else:
-                    gt_snr_label.config(text="SNR: N/A")
+                    gt_snr_label.config(text="SNR - pixelwise: N/A")
+                
+                # Update PSD-based SNR label
+                if 'psd_snr_db' in gt_metrics and gt_metrics['psd_snr_db'] is not None and not np.isnan(gt_metrics['psd_snr_db']):
+                    if np.isinf(gt_metrics['psd_snr_db']):
+                        gt_psd_snr_label.config(text=f"SNR - PSD: \u221E dB")  # Unicode infinity symbol
+                    else:
+                        gt_psd_snr_label.config(text=f"SNR - PSD: {gt_metrics['psd_snr_db']:.2f} dB")
+                else:
+                    gt_psd_snr_label.config(text="SNR - PSD: N/A")
                 
                 # Update PSNR label
                 if gt_metrics['psnr'] is not None and not np.isnan(gt_metrics['psnr']):
@@ -1296,7 +1357,8 @@ class DenoiseWindow(tk.Toplevel):
                 
             except Exception as e:
                 print(f"Error calculating ground truth metrics for {title}{region_label_psd}: {e}")
-                gt_snr_label.config(text="SNR: Error")
+                gt_snr_label.config(text="SNR - pixelwise: Error")
+                gt_psd_snr_label.config(text="SNR - PSD: Error")
                 gt_psnr_label.config(text="PSNR: Error")
                 gt_rmse_label.config(text="RMSE: Error")
             
@@ -1456,10 +1518,90 @@ class DenoiseWindow(tk.Toplevel):
 
     # =================== Single Value Metric Calculations ==================
 
+    def calculate_psd_based_snr_with_ground_truth(self, input_image, clean_image):
+        """
+        Calculate SNR using Power Spectral Density comparison between input and clean images.
+        
+        This method:
+        1. Computes PSD of the clean signal (ground truth)
+        2. Computes PSD of the input signal (noisy/denoised)
+        3. Estimates noise PSD as |PSD_input - PSD_clean|
+        4. Calculates SNR as ratio of signal power to noise power in frequency domain
+        
+        Parameters:
+            input_image (ndarray): Input image (noisy or denoised)
+            clean_image (ndarray): Clean reference image
+            
+        Returns:
+            dict: Dictionary containing PSD-based metrics
+        """
+        if input_image.shape != clean_image.shape:
+            raise ValueError("Input and clean images must have the same shape")
+            
+        M, N = input_image.shape
+        if M < 2 or N < 2:
+            return {
+                "psd_snr_linear": np.nan,
+                "psd_snr_db": np.nan,
+                "signal_psd_power": np.nan,
+                "noise_psd_power": np.nan
+            }
+        
+        # Compute 2D FFT and PSD for both images
+        F_input = np.fft.fft2(input_image)
+        F_clean = np.fft.fft2(clean_image)
+        
+        F_input_shifted = np.fft.fftshift(F_input)
+        F_clean_shifted = np.fft.fftshift(F_clean)
+        
+        # Power Spectral Densities
+        PSD_input = np.abs(F_input_shifted)**2
+        PSD_clean = np.abs(F_clean_shifted)**2
+        
+        # Method 1: Direct approach - treat difference in frequency domain as noise
+        # Noise PSD = |PSD_input - PSD_clean|
+        # This captures how the input deviates from the clean signal in frequency domain
+        PSD_noise = np.abs(PSD_input - PSD_clean)
+        
+        # Total power calculations
+        P_signal_total = np.sum(PSD_clean)
+        P_noise_total = np.sum(PSD_noise)
+        
+        # Calculate SNR
+        if P_noise_total < 1e-12:  # Effectively zero noise
+            if P_signal_total > 1e-12:
+                snr_linear = np.inf
+            else:
+                snr_linear = np.nan  # Both signal and noise are zero
+        else:
+            snr_linear = P_signal_total / P_noise_total
+            
+        # SNR in dB
+        if np.isnan(snr_linear):
+            snr_db = np.nan
+        elif np.isinf(snr_linear):
+            snr_db = np.inf
+        elif snr_linear <= 0:
+            snr_db = -np.inf
+        else:
+            snr_db = 10 * np.log10(snr_linear)
+            
+        return {
+            "psd_snr_linear": snr_linear,
+            "psd_snr_db": snr_db,
+            "signal_psd_power": P_signal_total,
+            "noise_psd_power": P_noise_total,
+            "psd_clean": PSD_clean,
+            "psd_input": PSD_input,
+            "psd_noise": PSD_noise
+        }
+
     def calculate_ground_truth_metrics(self, input_image_arg, clean_image_raw_arg):
         """
         Calculate SNR, PSNR, RMSE, and other statistical metrics between an input image 
         and a clean reference image. Handles scaling consistently based on self.rescale_var.
+        
+        Now includes both spatial-domain and PSD-based SNR calculations.
         
         Parameters:
             input_image_arg (ndarray): Input image data (e.g., noisy or denoised).
@@ -1468,7 +1610,8 @@ class DenoiseWindow(tk.Toplevel):
             clean_image_raw_arg (ndarray): Raw clean reference image data.
             
         Returns:
-            dict: Containing various metrics including std, skewness, kurtosis of the residual.
+            dict: Containing various metrics including std, skewness, kurtosis of the residual,
+                  plus PSD-based SNR metrics.
         """
         
         processed_input = input_image_arg.copy()
@@ -1549,7 +1692,7 @@ class DenoiseWindow(tk.Toplevel):
                  else: ks_pval = 1.0 # Or handle as undefined for N=1. For now, 1.0.
 
 
-        # --- SNR, PSNR, RMSE ---
+        # --- SNR, PSNR, RMSE (Spatial domain) ---
         # Calculate signal power (from the processed clean image)
         signal_power = np.mean(processed_clean ** 2)
         
@@ -1580,7 +1723,22 @@ class DenoiseWindow(tk.Toplevel):
         else:
             psnr = 20 * np.log10(data_range / rmse)
             
-        return {
+        # --- PSD-based SNR calculation ---
+        psd_metrics = {}
+        try:
+            psd_metrics = self.calculate_psd_based_snr_with_ground_truth(processed_input, processed_clean)
+            print(f"DEBUG PSD-based SNR: {psd_metrics['psd_snr_db']:.2f} dB (spatial: {snr_db:.2f} dB)")
+        except Exception as e:
+            print(f"Warning: PSD-based SNR calculation failed: {e}")
+            psd_metrics = {
+                "psd_snr_linear": np.nan,
+                "psd_snr_db": np.nan,
+                "signal_psd_power": np.nan,
+                "noise_psd_power": np.nan
+            }
+            
+        # Combine all metrics
+        result = {
             'mse': mse,
             'rmse': rmse,
             'psnr': psnr,
@@ -1599,6 +1757,11 @@ class DenoiseWindow(tk.Toplevel):
             'scaled_clean_used_for_metrics': processed_clean, # The version of clean image used for metrics
             'scaled_residual': noise  # The computed residual used for metrics
         }
+        
+        # Add PSD-based metrics
+        result.update(psd_metrics)
+            
+        return result
 
     # ==================== Residual Analysis =====================
     def open_residual_analysis_window(self, denoised_title_str, denoised_image_data_full):

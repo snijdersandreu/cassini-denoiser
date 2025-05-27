@@ -274,7 +274,7 @@ def apply_denoising(image, sigma=None, method="wiener"):
     Parameters:
         image (ndarray): Input 2D image array.
         sigma (float, optional): Estimated noise standard deviation. Used by some methods.
-        method (str): Denoising method to use. One of "wiener", "starlet", "bm3d", "unet-self2self".
+        method (str): Denoising method to use. One of "wiener", "starlet", "bm3d", "total_variation".
 
     Returns:
         ndarray: Denoised image.
@@ -293,8 +293,8 @@ def apply_denoising(image, sigma=None, method="wiener"):
         raise NotImplementedError("Starlet denoising is not implemented yet.")
     elif method == "bm3d":
         raise NotImplementedError("BM3D denoising is not implemented yet.")
-    elif method == "unet-self2self":
-        raise NotImplementedError("U-Net Self2Self denoising is not implemented yet.")
+    elif method == "total_variation":
+        raise NotImplementedError("Total Variation denoising is not implemented yet.")
     else:
         raise ValueError(f"Unknown denoising method: {method}")
 

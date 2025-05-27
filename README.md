@@ -10,7 +10,7 @@ A collection of tools for noise analysis and image denoising, primarily focused 
     *   Non-Local Means (NLM)
     *   Starlet Transform Denoising
     *   BM3D
-    *   UNet Self2Self (Deep Learning based)
+    *   Total Variation (Edge-preserving regularization)
     *   Wiener Filter
 *   **Image Analysis Tools**: Scripts for noise characterization, Signal-to-Noise Ratio (SNR) analysis, contrast analysis, and histogram analysis.
 *   **Image Simulation**: Utilities like `adapt_simulation.py` for creating simulated datasets.
