@@ -97,9 +97,12 @@ except KeyError:
 # 2. Generate Gaussian noise image
 # noise_shape = clean_image.shape # Use the shape of the clean image
 # noise_shape = (1024, 1024) # Use a much larger shape for the noise image
-noise_shape = (100, 100) # Set noise image size to 100x100
+noise_shape = clean_image.shape # Use the same shape as clean image for proper combination
 noise_std_dev = 0.0012
 noise_image = generate_gaussian_noise_image(noise_shape, noise_std_dev)
+
+# 3. Create noisy image by combining clean image and noise
+noisy_image = clean_image + noise_image
 
 # # 3. Compute PSDs (Now done within calculate_radial_psd)
 # psd_clean = compute_psd(clean_image)
@@ -108,10 +111,11 @@ noise_image = generate_gaussian_noise_image(noise_shape, noise_std_dev)
 # 4. Compute Radially Averaged PSDs
 radii_clean, rap_clean = calculate_radial_psd(clean_image) 
 radii_noise, rap_noise = calculate_radial_psd(noise_image)
+radii_noisy, rap_noisy = calculate_radial_psd(noisy_image)
 
 
 # 5. Plotting
-fig, axs = plt.subplots(2, 3, figsize=(18, 10))
+fig, axs = plt.subplots(3, 3, figsize=(18, 15))
 fig.suptitle('Radially Averaged PSD Visualization', fontsize=16)
 
 # Clean Image Column
@@ -171,6 +175,37 @@ axs[1, 2].set_xlim(0, 0.55)
 axs[1, 2].grid(True, linestyle='--', alpha=0.7)
 axs[1, 2].legend()
 
+
+# Noisy Image Column (Clean + Noise)
+axs[2, 0].imshow(noisy_image, cmap='gray')
+axs[2, 0].set_title('Noisy Image (Clean + Noise)')
+axs[2, 0].axis('off')
+
+_psd_noisy_for_plot = np.abs(fftshift(fft2(noisy_image)))**2
+axs[2, 1].imshow(np.log10(_psd_noisy_for_plot + 1e-9), cmap='viridis') 
+axs[2, 1].set_title('PSD of Noisy Image (log scale)')
+axs[2, 1].axis('off')
+
+# Add concentric circles to noisy PSD plot
+h_noisy, w_noisy = _psd_noisy_for_plot.shape
+center_x_noisy, center_y_noisy = w_noisy // 2, h_noisy // 2
+max_radius_noisy = min(center_x_noisy, center_y_noisy)
+circle_radii_noisy = [max_radius_noisy * r for r in [0.15, 0.3, 0.45, 0.6, 0.75]]
+for radius in circle_radii_noisy:
+    circle = patches.Circle((center_x_noisy, center_y_noisy), radius, fill=False, edgecolor='white', linestyle='--', alpha=0.7, linewidth=1.5)
+    axs[2, 1].add_patch(circle)
+
+# Combined Radially Averaged PSDs comparison
+axs[2, 2].plot(radii_clean, rap_clean, label='Clean Image', color='blue', linewidth=2)
+axs[2, 2].plot(radii_noise, rap_noise, label='Noise Only', color='red', linewidth=2)
+axs[2, 2].plot(radii_noisy, rap_noisy, label='Noisy Image (Clean + Noise)', color='purple', linewidth=2)
+axs[2, 2].set_title('Radially Averaged PSD Comparison')
+axs[2, 2].set_xlabel('Spatial Frequency (cycles/pixel)')
+axs[2, 2].set_ylabel('Avg. Power (log)')
+axs[2, 2].set_yscale('log')
+axs[2, 2].set_xlim(0, 0.55)
+axs[2, 2].grid(True, linestyle='--', alpha=0.7)
+axs[2, 2].legend()
 
 plt.tight_layout(rect=[0, 0, 1, 0.96]) # Adjust layout to make space for suptitle
 

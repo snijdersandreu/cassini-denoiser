@@ -408,7 +408,7 @@ class DenoiseWindow(tk.Toplevel):
         info_frame.pack(fill='x', padx=5)
 
         # Create PSD plot area instead of metrics label
-        psd_fig = Figure(figsize=(self.preview_size/80, 1.5), dpi=100) # Adjusted size
+        psd_fig = Figure(figsize=(self.preview_size/80, 2.25), dpi=100) # Increased height from 1.5 to 2.25
         psd_ax = psd_fig.add_subplot(111)
         psd_canvas = FigureCanvasTkAgg(psd_fig, master=info_frame)
         psd_canvas_widget = psd_canvas.get_tk_widget()
@@ -1088,16 +1088,28 @@ class DenoiseWindow(tk.Toplevel):
         # Calculate radial distance (spatial frequency magnitude) for each pixel
         k_radial = np.sqrt(kx**2 + ky**2)
 
-        # Define number of bins for radial averaging
-        # Use half the smaller dimension as a reasonable upper limit for frequency
-        max_freq_index = min(h, w) // 2
-        num_bins = max_freq_index # Use one bin per frequency index up to Nyquist
+        # Define number of bins for radial averaging - MUCH FINER RESOLUTION
+        # Use a high number of bins for better frequency resolution
+        max_freq = np.max(k_radial)
+        
+        # Set minimum number of bins for fine resolution
+        min_bins = 200  # Much higher than before
+        
+        # Calculate based on image size but ensure we have at least min_bins
+        size_based_bins = min(h, w) * 2  # More bins relative to image size
+        
+        # Use the larger of the two approaches
+        num_bins = max(min_bins, size_based_bins)
+        
+        # Cap at reasonable maximum for performance (but much higher than before)
+        max_bins = 1000
+        num_bins = min(num_bins, max_bins)
 
         if num_bins < 1:
              print("Warning: Patch too small for meaningful PSD binning.")
              return None, None
 
-        bin_edges = np.linspace(0, np.max(k_radial), num_bins + 1)
+        bin_edges = np.linspace(0, max_freq, num_bins + 1)
         bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
 
         # Bin the radial frequencies
@@ -1763,6 +1775,71 @@ class DenoiseWindow(tk.Toplevel):
             
         return result
 
+    def calculate_residual_only_metrics(self, residual_image):
+        """
+        Calculate basic statistical metrics for a residual image without ground truth.
+        
+        Parameters:
+            residual_image (ndarray): Residual image data
+            
+        Returns:
+            dict: Containing basic statistical metrics for the residual
+        """
+        try:
+            residual_flat = residual_image.ravel()
+            residual_mean = np.mean(residual_flat)
+            residual_std = np.std(residual_flat)
+            
+            # Basic statistics
+            metrics = {
+                'std': residual_std,
+                'min': np.min(residual_flat),
+                'max': np.max(residual_flat),
+                'mean': residual_mean,
+                'snr_db': None,  # Not available without ground truth
+                'psnr': None,    # Not available without ground truth  
+                'rmse': None     # Not available without ground truth
+            }
+            
+            # Skewness and kurtosis
+            try:
+                metrics['skew'] = skew(residual_flat, bias=False)
+            except ValueError:
+                metrics['skew'] = 0.0
+                
+            try:
+                metrics['kurt'] = kurtosis(residual_flat, fisher=False)
+            except ValueError:
+                metrics['kurt'] = 3.0
+            
+            # Kolmogorov-Smirnov test for normality
+            if residual_std > 1e-12:
+                try:
+                    standardized_residual = (residual_flat - residual_mean) / residual_std
+                    _, metrics['pval'] = kstest(standardized_residual, 'norm')
+                except Exception:
+                    metrics['pval'] = 0.5
+            else:
+                metrics['pval'] = 0.0 if len(residual_flat) > 1 else 1.0
+                
+            return metrics
+            
+        except Exception as e:
+            print(f"Error calculating residual metrics: {e}")
+            # Return basic fallback metrics
+            return {
+                'std': 0.0,
+                'skew': 0.0,
+                'kurt': 3.0,
+                'min': 0.0,
+                'max': 0.0,
+                'mean': 0.0,
+                'pval': 0.5,
+                'snr_db': None,
+                'psnr': None,
+                'rmse': None
+            }
+
     # ==================== Residual Analysis =====================
     def open_residual_analysis_window(self, denoised_title_str, denoised_image_data_full):
         """
@@ -1891,53 +1968,81 @@ class DenoiseWindow(tk.Toplevel):
 
                 if self.rescale_var.get() and sf_val > 1e-8:
                     scaled_clean_for_den_display = (raw_clean_slice_for_denoised_comp - p1_val) / sf_val
-                    actual_denoised_residual = denoised_data_slice - scaled_clean_for_den_display
+                    actual_filtered_minus_clean_residual = denoised_data_slice - scaled_clean_for_den_display
                     
                     if original_noisy_data_slice is not None and raw_clean_slice_for_noisy_comp is not None:
                         if raw_clean_slice_for_noisy_comp.shape == original_noisy_data_slice.shape:
                              scaled_clean_for_noisy_display = (raw_clean_slice_for_noisy_comp - p1_val) / sf_val
-                             actual_noisy_residual = original_noisy_data_slice - scaled_clean_for_noisy_display
+                             actual_noisy_minus_clean_residual = original_noisy_data_slice - scaled_clean_for_noisy_display
+                             # Calculate noisy - filtered residual for main display
+                             if denoised_data_slice.shape == original_noisy_data_slice.shape:
+                                 actual_noisy_minus_filtered_residual = original_noisy_data_slice - denoised_data_slice
+                             else:
+                                 actual_noisy_minus_filtered_residual = None
                         else:
                             print("WARNING: Noisy residual image for display cannot be computed due to shape mismatch after scaling attempt.")
-                            actual_noisy_residual = original_noisy_data_slice # Show original scaled noisy as fallback display
+                            actual_noisy_minus_clean_residual = original_noisy_data_slice # Show original scaled noisy as fallback display
+                            actual_noisy_minus_filtered_residual = None
                 else: # Rescale OFF or bad scale_factor
-                    actual_denoised_residual = denoised_data_slice - raw_clean_slice_for_denoised_comp
+                    actual_filtered_minus_clean_residual = denoised_data_slice - raw_clean_slice_for_denoised_comp
                     if original_noisy_data_slice is not None and raw_clean_slice_for_noisy_comp is not None:
                          if raw_clean_slice_for_noisy_comp.shape == original_noisy_data_slice.shape:
-                            actual_noisy_residual = original_noisy_data_slice - raw_clean_slice_for_noisy_comp
+                            actual_noisy_minus_clean_residual = original_noisy_data_slice - raw_clean_slice_for_noisy_comp
+                            # Calculate noisy - filtered residual for main display
+                            if denoised_data_slice.shape == original_noisy_data_slice.shape:
+                                actual_noisy_minus_filtered_residual = original_noisy_data_slice - denoised_data_slice
+                            else:
+                                actual_noisy_minus_filtered_residual = None
                          else:
-                            actual_noisy_residual = original_noisy_data_slice
+                            actual_noisy_minus_clean_residual = original_noisy_data_slice
+                            actual_noisy_minus_filtered_residual = None
 
-                if actual_denoised_residual is None:
+                # Set main residual to noisy - filtered if available, otherwise fallback to filtered - clean
+                if actual_noisy_minus_filtered_residual is not None:
+                    main_residual_for_display = actual_noisy_minus_filtered_residual
+                    comparison_residual_for_display = locals().get('actual_noisy_minus_clean_residual', None)
+                    main_title_for_display = f"{self.noisy_image_display_title} - {denoised_title_str}"
+                    comparison_title_for_display = f"{self.noisy_image_display_title} - Clean" if comparison_residual_for_display is not None else None
+                    # Use noisy vs filtered metrics for main display
+                    if original_noisy_data_slice is not None and denoised_data_slice.shape == original_noisy_data_slice.shape:
+                        main_metrics_for_display = self.calculate_residual_only_metrics(actual_noisy_minus_filtered_residual)
+                    else:
+                        main_metrics_for_display = metrics_denoised_vs_clean
+                    comparison_metrics_for_display = metrics_noisy_vs_clean
+                else:
+                    # Fallback to original behavior
+                    main_residual_for_display = actual_filtered_minus_clean_residual
+                    comparison_residual_for_display = locals().get('actual_noisy_minus_clean_residual', None)
+                    main_title_for_display = f"{denoised_title_str} - Clean"
+                    comparison_title_for_display = f"{self.noisy_image_display_title} - Clean" if comparison_residual_for_display is not None else None
+                    main_metrics_for_display = metrics_denoised_vs_clean
+                    comparison_metrics_for_display = metrics_noisy_vs_clean
+
+                if main_residual_for_display is None:
                     tkinter.messagebox.showerror("Calculation Error", "Failed to calculate main residual image for analysis.")
                     return
                 
                 # Prepare titles for popup
                 snr_text_main = "N/A"
-                if 'snr_db' in metrics_denoised_vs_clean and metrics_denoised_vs_clean['snr_db'] is not None:
-                    snr_val_main = "∞" if np.isinf(metrics_denoised_vs_clean['snr_db']) else f"{metrics_denoised_vs_clean['snr_db']:.2f}"
+                if 'snr_db' in main_metrics_for_display and main_metrics_for_display['snr_db'] is not None:
+                    snr_val_main = "∞" if np.isinf(main_metrics_for_display['snr_db']) else f"{main_metrics_for_display['snr_db']:.2f}"
                     snr_text_main = f"SNR: {snr_val_main}dB"
 
                 psnr_text_main = "N/A"
-                if 'psnr' in metrics_denoised_vs_clean and metrics_denoised_vs_clean['psnr'] is not None:
-                    psnr_val_main = "∞" if np.isinf(metrics_denoised_vs_clean['psnr']) else f"{metrics_denoised_vs_clean['psnr']:.2f}"
+                if 'psnr' in main_metrics_for_display and main_metrics_for_display['psnr'] is not None:
+                    psnr_val_main = "∞" if np.isinf(main_metrics_for_display['psnr']) else f"{main_metrics_for_display['psnr']:.2f}"
                     psnr_text_main = f"PSNR: {psnr_val_main}dB"
 
-                window_title_base = f"{denoised_title_str} Residuals (vs Clean){region_label}"
+                window_title_base = f"{main_title_for_display} Residuals{region_label}"
                 window_title = f"{window_title_base} - {snr_text_main}, {psnr_text_main}"
                 
-                popup_main_title = f"{denoised_title_str} - Clean"
-                popup_comparison_title = None
-                if actual_noisy_residual is not None and metrics_noisy_vs_clean:
-                    popup_comparison_title = f"{self.noisy_image_display_title} - Clean"
-                
                 ResidualAnalysisPopup(self, 
-                                    main_residual=actual_denoised_residual, 
-                                    metrics=metrics_denoised_vs_clean, # This now comes from calculate_ground_truth_metrics
-                                    comparison_residual=actual_noisy_residual,
-                                    comparison_metrics=metrics_noisy_vs_clean, # This also from calculate_ground_truth_metrics
-                                    main_title=popup_main_title,
-                                    comparison_title=popup_comparison_title,
+                                    main_residual=main_residual_for_display, 
+                                    metrics=main_metrics_for_display,
+                                    comparison_residual=comparison_residual_for_display,
+                                    comparison_metrics=comparison_metrics_for_display,
+                                    main_title=main_title_for_display,
+                                    comparison_title=comparison_title_for_display,
                                     window_title=window_title,
                                     region_label=region_label)
                 
