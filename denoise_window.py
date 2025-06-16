@@ -2584,6 +2584,10 @@ class DenoiseWindow(tk.Toplevel):
         notebook.add(hist_frame, text="Histograms")
         notebook.add(residual_frame, text="Residual Images")
 
+        # New tab for PSD Error
+        psd_error_frame = ttk.Frame(notebook)
+        notebook.add(psd_error_frame, text="PSD Error")
+
         # Determine if a region is selected and get its coordinates and label
         region_label = " (Global)"
         data_coords = None
@@ -2605,6 +2609,7 @@ class DenoiseWindow(tk.Toplevel):
         self._create_summary_center_horizontal_psd_plot(horiz_psd_frame, data_coords, region_label)
         self._create_summary_hist_plot(hist_frame, data_coords, region_label)
         self._create_summary_residual_plot(residual_frame, data_coords, region_label)
+        self._create_summary_psd_error_plot(psd_error_frame, data_coords, region_label)
 
     def _get_plot_data(self):
         plot_data = {'clean': None, 'noisy': None, 'denoised': []}
@@ -2619,47 +2624,85 @@ class DenoiseWindow(tk.Toplevel):
         return plot_data
 
     def _create_summary_psd_plot(self, parent_frame, data_coords, region_label):
-        fig = Figure(figsize=(10, 7), dpi=100)
-        ax = fig.add_subplot(111)
+        # Create a frame for controls on the left
+        controls_parent_frame = ttk.Frame(parent_frame)
+        controls_parent_frame.pack(side='left', fill='y', padx=10, pady=10)
+        
+        controls_frame = ttk.LabelFrame(controls_parent_frame, text="Displayed Signals")
+        controls_frame.pack()
 
+        # Create a frame for the plot on the right
+        plot_frame = ttk.Frame(parent_frame)
+        plot_frame.pack(side='left', fill='both', expand=True)
+
+        self.summary_psd_fig = Figure(figsize=(10, 7), dpi=100)
+        self.summary_psd_ax = self.summary_psd_fig.add_subplot(111)
+
+        self.summary_psd_canvas = FigureCanvasTkAgg(self.summary_psd_fig, master=plot_frame)
+        
+        toolbar = NavigationToolbar2Tk(self.summary_psd_canvas, plot_frame)
+        toolbar.update()
+        
+        toolbar.pack(side=tk.BOTTOM, fill=tk.X)
+        self.summary_psd_canvas.get_tk_widget().pack(fill='both', expand=True)
+        
         plot_data = self._get_plot_data()
         
-        data_to_plot = []
-        if plot_data.get('clean'): data_to_plot.append(plot_data['clean'])
-        if plot_data.get('noisy'): data_to_plot.append(plot_data['noisy'])
-        data_to_plot.extend(plot_data.get('denoised', []))
+        self.radially_avg_psd_data = {}
+        self.psd_plot_vars = {}
 
-        for item in data_to_plot:
+        all_items_to_plot = []
+        if plot_data.get('clean'): all_items_to_plot.append(plot_data['clean'])
+        if plot_data.get('noisy'): all_items_to_plot.append(plot_data['noisy'])
+        all_items_to_plot.extend(plot_data.get('denoised', []))
+        
+        # Pre-calculate PSDs and create checkboxes
+        for item in all_items_to_plot:
+            title = item['title']
             image_data = item['data']
+            
             if image_data is not None:
-                # Use slice if region is selected
                 data_slice = image_data
                 if data_coords:
                     dx0, dy0, dx1, dy1 = data_coords
                     if dy1 <= image_data.shape[0] and dx1 <= image_data.shape[1]:
                         data_slice = image_data[dy0:dy1, dx0:dx1]
-
+                
                 freqs, psd = self.calculate_radial_psd(data_slice)
                 if freqs is not None and psd is not None:
-                    ax.plot(freqs, psd, label=item['title'], linewidth=1)
+                    self.radially_avg_psd_data[title] = {'freqs': freqs, 'psd': psd}
+                    
+                    # Create checkbox for this item
+                    var = tk.BooleanVar(value=True)
+                    cb = ttk.Checkbutton(
+                        controls_frame, 
+                        text=title, 
+                        variable=var, 
+                        command=lambda: self._update_summary_psd_plot(region_label)
+                    )
+                    cb.pack(anchor='w', padx=5, pady=2)
+                    self.psd_plot_vars[title] = var
         
-        ax.set_yscale('log')
-        ax.set_title(f"Radially Averaged Power Spectral Density{region_label}")
-        ax.set_xlabel("Spatial Frequency")
-        ax.set_ylabel("Avg. Power (log)")
-        ax.grid(True, which='both', linestyle='--', linewidth=0.5, alpha=0.5)
-        ax.legend()
-        fig.tight_layout()
+        # Initial plot draw
+        self._update_summary_psd_plot(region_label)
 
-        canvas = FigureCanvasTkAgg(fig, master=parent_frame)
-        canvas.draw()
+    def _update_summary_psd_plot(self, region_label):
+        self.summary_psd_ax.clear()
         
-        toolbar = NavigationToolbar2Tk(canvas, parent_frame)
-        toolbar.update()
+        for title, var in self.psd_plot_vars.items():
+            if var.get() and title in self.radially_avg_psd_data:
+                data = self.radially_avg_psd_data[title]
+                self.summary_psd_ax.plot(data['freqs'], data['psd'], label=title, linewidth=1)
         
-        toolbar.pack(side=tk.BOTTOM, fill=tk.X)
-        canvas.get_tk_widget().pack(fill='both', expand=True)
-    
+        self.summary_psd_ax.set_yscale('log')
+        self.summary_psd_ax.set_title(f"Radially Averaged Power Spectral Density{region_label}")
+        self.summary_psd_ax.set_xlabel("Spatial Frequency")
+        self.summary_psd_ax.set_ylabel("Avg. Power (log)")
+        self.summary_psd_ax.grid(True, which='both', linestyle='--', linewidth=0.5, alpha=0.5)
+        self.summary_psd_ax.legend()
+        self.summary_psd_fig.tight_layout()
+        self.summary_psd_canvas.draw()
+
     def _create_summary_center_horizontal_psd_plot(self, parent_frame, data_coords, region_label):
         fig = Figure(figsize=(10, 7), dpi=100)
         ax = fig.add_subplot(111)
@@ -2967,6 +3010,114 @@ class DenoiseWindow(tk.Toplevel):
 
         # Don't plot the DC component (frequency 0)
         return frequencies[1:], power_spectrum[1:]
+
+    def _create_summary_psd_error_plot(self, parent_frame, data_coords, region_label):
+        plot_data = self._get_plot_data()
+        
+        if not plot_data.get('clean') or not plot_data.get('denoised'):
+            ttk.Label(parent_frame, text="PSD Error plot requires a clean reference and at least one denoised result.").pack(pady=20)
+            return
+            
+        # --- UI Setup ---
+        controls_parent_frame = ttk.Frame(parent_frame)
+        controls_parent_frame.pack(side='left', fill='y', padx=10, pady=10)
+        
+        plot_frame = ttk.Frame(parent_frame)
+        plot_frame.pack(side='left', fill='both', expand=True)
+        
+        # Combobox for denoiser selection
+        denoiser_frame = ttk.LabelFrame(controls_parent_frame, text="Select Denoiser")
+        denoiser_frame.pack(pady=5)
+        
+        self.psd_error_denoiser_var = tk.StringVar()
+        denoiser_names = [d['title'] for d in plot_data['denoised']]
+        self.psd_error_denoiser_combo = ttk.Combobox(
+            denoiser_frame,
+            textvariable=self.psd_error_denoiser_var,
+            values=denoiser_names,
+            state='readonly'
+        )
+        self.psd_error_denoiser_combo.pack(padx=5, pady=5)
+        if denoiser_names:
+            self.psd_error_denoiser_combo.current(0)
+        
+        # Checkboxes for what to display
+        display_frame = ttk.LabelFrame(controls_parent_frame, text="Display Options")
+        display_frame.pack(pady=5)
+        
+        self.psd_error_show_noisy_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(display_frame, text="Show |Noisy - Clean|", variable=self.psd_error_show_noisy_var).pack(anchor='w', padx=5)
+        
+        self.psd_error_show_denoised_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(display_frame, text="Show |Denoised - Clean|", variable=self.psd_error_show_denoised_var).pack(anchor='w', padx=5)
+        
+        # Apply button
+        ttk.Button(controls_parent_frame, text="Update Plot", command=lambda: self._update_psd_error_plot(data_coords, region_label)).pack(pady=10)
+
+        # --- Plotting Setup ---
+        self.psd_error_fig = Figure(figsize=(10, 7), dpi=100)
+        self.psd_error_ax = self.psd_error_fig.add_subplot(111)
+        self.psd_error_canvas = FigureCanvasTkAgg(self.psd_error_fig, master=plot_frame)
+        
+        toolbar = NavigationToolbar2Tk(self.psd_error_canvas, plot_frame)
+        toolbar.update()
+        toolbar.pack(side=tk.BOTTOM, fill=tk.X)
+        self.psd_error_canvas.get_tk_widget().pack(fill='both', expand=True)
+        
+        # Initial plot
+        self._update_psd_error_plot(data_coords, region_label)
+
+    def _update_psd_error_plot(self, data_coords, region_label):
+        self.psd_error_ax.clear()
+        plot_data = self._get_plot_data()
+        
+        selected_denoiser_title = self.psd_error_denoiser_var.get()
+        if not selected_denoiser_title:
+            self.psd_error_ax.text(0.5, 0.5, "Please select a denoiser to compare.", ha='center', va='center')
+            self.psd_error_canvas.draw()
+            return
+            
+        # Helper to get PSD for a given widget_info
+        def get_psd(widget_info):
+            if widget_info is None or widget_info['data'] is None: return None, None
+            data = widget_info['data']
+            data_slice = data
+            if data_coords:
+                dx0, dy0, dx1, dy1 = data_coords
+                if dy1 <= data.shape[0] and dx1 <= data.shape[1]:
+                    data_slice = data[dy0:dy1, dx0:dx1]
+            return self.calculate_radial_psd(data_slice)
+
+        # Get PSDs
+        clean_freqs, clean_psd = get_psd(plot_data['clean'])
+        if clean_psd is None:
+            self.psd_error_ax.text(0.5, 0.5, "Could not calculate PSD for Clean Reference.", ha='center', va='center')
+            self.psd_error_canvas.draw()
+            return
+
+        # Plot noisy error
+        if self.psd_error_show_noisy_var.get():
+            noisy_freqs, noisy_psd = get_psd(plot_data['noisy'])
+            if noisy_psd is not None and len(noisy_psd) == len(clean_psd):
+                noisy_error = np.abs(noisy_psd - clean_psd)
+                self.psd_error_ax.plot(clean_freqs, noisy_error, label="|Noisy - Clean|", linewidth=1.5, alpha=0.8)
+                
+        # Plot denoised error
+        if self.psd_error_show_denoised_var.get():
+            selected_denoiser_info = next((d for d in plot_data['denoised'] if d['title'] == selected_denoiser_title), None)
+            denoised_freqs, denoised_psd = get_psd(selected_denoiser_info)
+            if denoised_psd is not None and len(denoised_psd) == len(clean_psd):
+                denoised_error = np.abs(denoised_psd - clean_psd)
+                self.psd_error_ax.plot(clean_freqs, denoised_error, label=f"|{selected_denoiser_title} - Clean|", linewidth=1.5)
+
+        self.psd_error_ax.set_yscale('log')
+        self.psd_error_ax.set_title(f"PSD Error vs. Clean Reference{region_label}")
+        self.psd_error_ax.set_xlabel("Spatial Frequency")
+        self.psd_error_ax.set_ylabel("Absolute Difference in Power (log)")
+        self.psd_error_ax.grid(True, which='both', linestyle='--', linewidth=0.5, alpha=0.5)
+        self.psd_error_ax.legend()
+        self.psd_error_fig.tight_layout()
+        self.psd_error_canvas.draw()
 
 
 class ResidualAnalysisPopup(tk.Toplevel):
