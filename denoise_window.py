@@ -95,35 +95,33 @@ class DenoiseWindow(tk.Toplevel):
 
         # Frame for manual region selection
         manual_select_frame = ttk.LabelFrame(top_actions_frame, text="Manual Region Selection (Image Coords)")
-        manual_select_frame.pack(side='left', padx=10)
+        manual_select_frame.pack(side='left', padx=10, pady=(0, 5))
 
-        coords_frame = ttk.Frame(manual_select_frame)
-        coords_frame.pack(padx=5, pady=(0, 2))
+        # All widgets will be packed into this frame horizontally
+        linear_layout_frame = ttk.Frame(manual_select_frame)
+        linear_layout_frame.pack(padx=5, pady=2)
 
-        ttk.Label(coords_frame, text="x0:").grid(row=0, column=0, sticky='w')
+        ttk.Label(linear_layout_frame, text="x0:").pack(side='left')
         self.x0_var = tk.StringVar()
-        ttk.Entry(coords_frame, textvariable=self.x0_var, width=5).grid(row=0, column=1, padx=(0, 5))
+        ttk.Entry(linear_layout_frame, textvariable=self.x0_var, width=5).pack(side='left', padx=(0, 5))
 
-        ttk.Label(coords_frame, text="y0:").grid(row=0, column=2, sticky='w')
-        self.y0_var = tk.StringVar()
-        ttk.Entry(coords_frame, textvariable=self.y0_var, width=5).grid(row=0, column=3)
-
-        ttk.Label(coords_frame, text="x1:").grid(row=1, column=0, sticky='w')
+        ttk.Label(linear_layout_frame, text="x1:").pack(side='left')
         self.x1_var = tk.StringVar()
-        ttk.Entry(coords_frame, textvariable=self.x1_var, width=5).grid(row=1, column=1, padx=(0, 5))
+        ttk.Entry(linear_layout_frame, textvariable=self.x1_var, width=5).pack(side='left', padx=(0, 10))
 
-        ttk.Label(coords_frame, text="y1:").grid(row=1, column=2, sticky='w')
+        ttk.Label(linear_layout_frame, text="y0:").pack(side='left')
+        self.y0_var = tk.StringVar()
+        ttk.Entry(linear_layout_frame, textvariable=self.y0_var, width=5).pack(side='left', padx=(0, 5))
+
+        ttk.Label(linear_layout_frame, text="y1:").pack(side='left')
         self.y1_var = tk.StringVar()
-        ttk.Entry(coords_frame, textvariable=self.y1_var, width=5).grid(row=1, column=3)
-        
-        btn_frame = ttk.Frame(manual_select_frame)
-        btn_frame.pack()
+        ttk.Entry(linear_layout_frame, textvariable=self.y1_var, width=5).pack(side='left', padx=(0, 10))
 
-        apply_coords_btn = ttk.Button(btn_frame, text="Apply", command=self.apply_manual_region)
-        apply_coords_btn.pack(side='left', pady=(0,5), padx=(0,2))
+        apply_coords_btn = ttk.Button(linear_layout_frame, text="Apply", command=self.apply_manual_region)
+        apply_coords_btn.pack(side='left', padx=(0, 2))
 
-        clear_coords_btn = ttk.Button(btn_frame, text="Clear", command=self.clear_manual_region)
-        clear_coords_btn.pack(side='left', pady=(0,5))
+        clear_coords_btn = ttk.Button(linear_layout_frame, text="Clear", command=self.clear_manual_region)
+        clear_coords_btn.pack(side='left')
 
         # Container for control panel and preview frame
         content_container = ttk.Frame(main_container)
@@ -2695,11 +2693,12 @@ class DenoiseWindow(tk.Toplevel):
                 self.summary_psd_ax.plot(data['freqs'], data['psd'], label=title, linewidth=1)
         
         self.summary_psd_ax.set_yscale('log')
-        self.summary_psd_ax.set_title(f"Radially Averaged Power Spectral Density{region_label}")
-        self.summary_psd_ax.set_xlabel("Spatial Frequency")
-        self.summary_psd_ax.set_ylabel("Avg. Power (log)")
+        self.summary_psd_ax.set_title("Radially Averaged Power Spectral Density", fontsize=28)
+        self.summary_psd_ax.set_xlabel("Spatial Frequency", fontsize=24)
+        self.summary_psd_ax.set_ylabel("Avg. Power (log)", fontsize=24)
         self.summary_psd_ax.grid(True, which='both', linestyle='--', linewidth=0.5, alpha=0.5)
-        self.summary_psd_ax.legend()
+        self.summary_psd_ax.legend(fontsize=20)
+        self.summary_psd_ax.tick_params(axis='both', which='major', labelsize=18)
         self.summary_psd_fig.tight_layout()
         self.summary_psd_canvas.draw()
 
@@ -2729,11 +2728,12 @@ class DenoiseWindow(tk.Toplevel):
                     ax.plot(freqs, psd, label=item['title'], linewidth=1)
         
         ax.set_yscale('log')
-        ax.set_title(f"Center Horizontal Line Power Spectral Density{region_label}")
-        ax.set_xlabel("Spatial Frequency")
-        ax.set_ylabel("Power (log)")
+        ax.set_title("Center Horizontal Line Power Spectral Density", fontsize=28)
+        ax.set_xlabel("Spatial Frequency", fontsize=24)
+        ax.set_ylabel("Power (log)", fontsize=24)
         ax.grid(True, which='both', linestyle='--', linewidth=0.5, alpha=0.5)
-        ax.legend()
+        ax.legend(fontsize=20)
+        ax.tick_params(axis='both', which='major', labelsize=18)
         fig.tight_layout()
 
         canvas = FigureCanvasTkAgg(fig, master=parent_frame)
@@ -2771,10 +2771,11 @@ class DenoiseWindow(tk.Toplevel):
                     p1, p99 = np.min(data_slice), np.max(data_slice)
                 ax.hist(data_slice.ravel(), bins=100, density=True, alpha=0.5, label=item['title'], range=(p1, p99))
 
-        ax.set_title(f"Image Histograms (1-99th percentile){region_label}")
-        ax.set_xlabel("Pixel Value")
-        ax.set_ylabel("Density")
-        ax.legend()
+        ax.set_title(f"Image Histograms (1-99th percentile){region_label}", fontsize=28)
+        ax.set_xlabel("Pixel Value", fontsize=24)
+        ax.set_ylabel("Density", fontsize=24)
+        ax.legend(fontsize=20)
+        ax.tick_params(axis='both', which='major', labelsize=18)
         fig.tight_layout()
 
         canvas = FigureCanvasTkAgg(fig, master=parent_frame)
@@ -2861,9 +2862,10 @@ class DenoiseWindow(tk.Toplevel):
             disp_img = create_display_image(residual_image, method='minmax')
             
             im = ax.imshow(disp_img, cmap='gray', aspect='auto')
-            ax.set_title(res_item['title'], fontsize=10)
+            ax.set_title(res_item['title'], fontsize=26)
             ax.axis('off')
-            fig.colorbar(im, ax=ax)
+            cbar = fig.colorbar(im, ax=ax)
+            cbar.ax.tick_params(labelsize=18)
 
         fig.tight_layout(pad=3.0)
 
@@ -3111,11 +3113,12 @@ class DenoiseWindow(tk.Toplevel):
                 self.psd_error_ax.plot(clean_freqs, denoised_error, label=f"|{selected_denoiser_title} - Clean|", linewidth=1.5)
 
         self.psd_error_ax.set_yscale('log')
-        self.psd_error_ax.set_title(f"PSD Error vs. Clean Reference{region_label}")
-        self.psd_error_ax.set_xlabel("Spatial Frequency")
-        self.psd_error_ax.set_ylabel("Absolute Difference in Power (log)")
+        self.psd_error_ax.set_title("PSD Error vs. Clean Reference", fontsize=28)
+        self.psd_error_ax.set_xlabel("Spatial Frequency", fontsize=24)
+        self.psd_error_ax.set_ylabel("Absolute Difference in Power (log)", fontsize=24)
         self.psd_error_ax.grid(True, which='both', linestyle='--', linewidth=0.5, alpha=0.5)
-        self.psd_error_ax.legend()
+        self.psd_error_ax.legend(fontsize=20)
+        self.psd_error_ax.tick_params(axis='both', which='major', labelsize=18)
         self.psd_error_fig.tight_layout()
         self.psd_error_canvas.draw()
 
