@@ -12,13 +12,15 @@ from denoising_algorithms import total_variation
 from denoising_algorithms import wiener as custom_wiener
 from denoising_algorithms import nlm_denoising # Add NLM import
 from matplotlib.figure import Figure
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 import matplotlib.pyplot as plt
 from scipy.ndimage import map_coordinates # For radial profile
 from scipy.stats import norm, skew, kurtosis, kstest, probplot # Added skew, kurtosis, kstest, probplot
 import tkinter.messagebox # Added for popups
 import threading # Added for NLM threading
 import queue     # Added for NLM threading
+import csv
+import matplotlib.patches as patches
 
 # Need laplace for new metrics
 from scipy.ndimage import laplace
@@ -66,16 +68,73 @@ class DenoiseWindow(tk.Toplevel):
         main_container = ttk.Frame(self)
         main_container.pack(expand=True, fill='both', padx=10, pady=10)
 
+        # Top action bar for buttons
+        top_actions_frame = ttk.Frame(main_container)
+        top_actions_frame.pack(side='top', fill='x', pady=(0, 5))
+
         # Button to toggle the control panel
-        self.toggle_button = ttk.Button(main_container, text="Hide Controls", command=self.toggle_controls)
-        self.toggle_button.pack(side='top', anchor='w', pady=(0, 5))
+        self.toggle_button = ttk.Button(top_actions_frame, text="Hide Controls", command=self.toggle_controls)
+        self.toggle_button.pack(side='left', anchor='w')
+        
+        # Add summary and export buttons to the top bar
+        self.summary_plots_btn = ttk.Button(
+            top_actions_frame,
+            text="Generate Summary Plots",
+            command=self.generate_summary_plots
+        )
+        self.summary_plots_btn.pack(side='left', anchor='w', padx=5)
+        self.summary_plots_btn.config(state=tk.DISABLED)
+
+        self.export_csv_btn = ttk.Button(
+            top_actions_frame,
+            text="Export Metrics to CSV",
+            command=self.export_metrics_to_csv
+        )
+        self.export_csv_btn.pack(side='left', anchor='w', padx=5)
+        self.export_csv_btn.config(state=tk.DISABLED)
+
+        # Frame for manual region selection
+        manual_select_frame = ttk.LabelFrame(top_actions_frame, text="Manual Region Selection (Image Coords)")
+        manual_select_frame.pack(side='left', padx=10)
+
+        coords_frame = ttk.Frame(manual_select_frame)
+        coords_frame.pack(padx=5, pady=(0, 2))
+
+        ttk.Label(coords_frame, text="x0:").grid(row=0, column=0, sticky='w')
+        self.x0_var = tk.StringVar()
+        ttk.Entry(coords_frame, textvariable=self.x0_var, width=5).grid(row=0, column=1, padx=(0, 5))
+
+        ttk.Label(coords_frame, text="y0:").grid(row=0, column=2, sticky='w')
+        self.y0_var = tk.StringVar()
+        ttk.Entry(coords_frame, textvariable=self.y0_var, width=5).grid(row=0, column=3)
+
+        ttk.Label(coords_frame, text="x1:").grid(row=1, column=0, sticky='w')
+        self.x1_var = tk.StringVar()
+        ttk.Entry(coords_frame, textvariable=self.x1_var, width=5).grid(row=1, column=1, padx=(0, 5))
+
+        ttk.Label(coords_frame, text="y1:").grid(row=1, column=2, sticky='w')
+        self.y1_var = tk.StringVar()
+        ttk.Entry(coords_frame, textvariable=self.y1_var, width=5).grid(row=1, column=3)
+        
+        btn_frame = ttk.Frame(manual_select_frame)
+        btn_frame.pack()
+
+        apply_coords_btn = ttk.Button(btn_frame, text="Apply", command=self.apply_manual_region)
+        apply_coords_btn.pack(side='left', pady=(0,5), padx=(0,2))
+
+        clear_coords_btn = ttk.Button(btn_frame, text="Clear", command=self.clear_manual_region)
+        clear_coords_btn.pack(side='left', pady=(0,5))
+
+        # Container for control panel and preview frame
+        content_container = ttk.Frame(main_container)
+        content_container.pack(expand=True, fill='both')
 
         # Left side: Control panel (initially visible)
-        self.control_frame = ttk.LabelFrame(main_container, text="Denoising Options")
+        self.control_frame = ttk.LabelFrame(content_container, text="Denoising Options")
         self.control_frame.pack(side='left', fill='y', padx=(0, 10)) # Initial packing
 
         # Right side: Image preview area
-        self.preview_frame = ttk.Frame(main_container)
+        self.preview_frame = ttk.Frame(content_container)
         self.preview_frame.pack(side='left', expand=True, fill='both')
 
         # Frame for algorithm result previews (including original)
@@ -137,8 +196,16 @@ class DenoiseWindow(tk.Toplevel):
 
         # k (threshold multiplier) input
         ttk.Label(starlet_params_frame, text="k (threshold):").grid(row=1, column=0, sticky="w")
-        self.starlet_k_var = tk.StringVar(value="3.0")
+        self.starlet_k_var = tk.StringVar(value="1.0") # Changed default from 3.0 to 1.0
         ttk.Entry(starlet_params_frame, textvariable=self.starlet_k_var, width=8).grid(row=1, column=1, padx=5)
+
+        # Sigma input for Starlet
+        ttk.Label(starlet_params_frame, text="Sigma:").grid(row=2, column=0, sticky="w")
+        self.starlet_sigma_var = tk.StringVar(value="") # Default to empty, so it estimates
+        ttk.Entry(starlet_params_frame, textvariable=self.starlet_sigma_var, width=8).grid(row=2, column=1, padx=5)
+        ttk.Label(starlet_params_frame, text="(estimate if empty)").grid(row=2, column=2, sticky="w")
+        # Add trace for dynamic k default
+        self.starlet_sigma_var.trace_add("write", self._update_starlet_k_default)
 
         self.bm3d_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
@@ -186,18 +253,16 @@ class DenoiseWindow(tk.Toplevel):
         tv_params_frame = ttk.Frame(tv_frame)
         tv_params_frame.pack(fill='x', padx=20, pady=2)
 
-        # Weight (regularization parameter)
-        ttk.Label(tv_params_frame, text="Weight:").grid(row=0, column=0, sticky="w")
-        self.tv_weight_var = tk.StringVar(value="0.1")
-        ttk.Entry(tv_params_frame, textvariable=self.tv_weight_var, width=8).grid(row=0, column=1, padx=5)
+        # New Sigma input for TV (replaces direct Weight)
+        ttk.Label(tv_params_frame, text="Sigma (Noise STD):").grid(row=0, column=0, sticky="w")
+        self.tv_sigma_var = tk.StringVar(value="0.01") # Default
+        ttk.Entry(tv_params_frame, textvariable=self.tv_sigma_var, width=8).grid(row=0, column=1, padx=5)
+        ttk.Label(tv_params_frame, text="(Required)").grid(row=0, column=2, sticky="w")
 
-        # Method selection
-        ttk.Label(tv_params_frame, text="Method:").grid(row=1, column=0, sticky="w")
-        self.tv_method_var = tk.StringVar(value="chambolle")
-        method_combo = ttk.Combobox(tv_params_frame, textvariable=self.tv_method_var, width=10)
-        method_combo['values'] = ('chambolle', 'rof', 'bregman')
-        method_combo.grid(row=1, column=1, padx=5)
-        method_combo.state(['readonly'])
+        # New C_tv (multiplier for Weight = C_tv * Sigma)
+        ttk.Label(tv_params_frame, text="C_tv (Weight=C_tv*Sigma):").grid(row=1, column=0, sticky="w")
+        self.tv_c_var = tk.StringVar(value="10.0") # Default for C_tv
+        ttk.Entry(tv_params_frame, textvariable=self.tv_c_var, width=8).grid(row=1, column=1, padx=5)
 
         # Max iterations
         ttk.Label(tv_params_frame, text="Max iter:").grid(row=2, column=0, sticky="w")
@@ -225,9 +290,16 @@ class DenoiseWindow(tk.Toplevel):
         self.nlm_patch_distance_var = tk.StringVar(value="10")
         ttk.Entry(nlm_params_frame, textvariable=self.nlm_patch_distance_var, width=8).grid(row=1, column=1, padx=5)
 
-        ttk.Label(nlm_params_frame, text="h (filtering):").grid(row=2, column=0, sticky="w")
-        self.nlm_h_var = tk.StringVar(value="0.1")
-        ttk.Entry(nlm_params_frame, textvariable=self.nlm_h_var, width=8).grid(row=2, column=1, padx=5)
+        # New Sigma input for NLM (replaces h)
+        ttk.Label(nlm_params_frame, text="Sigma (Noise STD):").grid(row=2, column=0, sticky="w")
+        self.nlm_sigma_var = tk.StringVar(value="0.01") # Default, user must provide
+        ttk.Entry(nlm_params_frame, textvariable=self.nlm_sigma_var, width=8).grid(row=2, column=1, padx=5)
+        ttk.Label(nlm_params_frame, text="(Required)").grid(row=2, column=2, sticky="w")
+
+        # New C (multiplier for h = C * Sigma)
+        ttk.Label(nlm_params_frame, text="C (h = C*Sigma):").grid(row=3, column=0, sticky="w")
+        self.nlm_c_var = tk.StringVar(value="1.0") # Default for C
+        ttk.Entry(nlm_params_frame, textvariable=self.nlm_c_var, width=8).grid(row=3, column=1, padx=5)
 
         # Rescaling options
         rescale_frame = ttk.LabelFrame(self.control_frame, text="Image Rescaling")
@@ -257,6 +329,28 @@ class DenoiseWindow(tk.Toplevel):
             self.control_frame.pack(side='left', fill='y', padx=(0, 10), before=self.preview_frame)
             self.toggle_button.config(text="Hide Controls")
         self.controls_visible = not self.controls_visible
+
+    def _update_starlet_k_default(self, *args):
+        """Dynamically update Starlet k default based on sigma input."""
+        sigma_val_str = self.starlet_sigma_var.get().strip()
+        k_val_str = self.starlet_k_var.get().strip()
+
+        try:
+            current_k_float = float(k_val_str)
+        except ValueError:
+            # k is not a valid float, user might be typing, do nothing
+            return
+
+        if sigma_val_str:  # Sigma field has content
+            # If k is at the "sigma-is-empty" default (3.0), suggest 1.0
+            if abs(current_k_float - 3.0) < 1e-6:
+                self.starlet_k_var.set("1.0")
+        else:  # Sigma field is empty
+            # If k is at the "sigma-is-filled" suggested default (1.0), revert to 3.0
+            if abs(current_k_float - 1.0) < 1e-6:
+                self.starlet_k_var.set("3.0")
+        # If k_val is something else (e.g., user manually typed "2.5"), 
+        # this function does nothing, respecting the user's explicit choice for k.
 
     def create_histogram(self, container, image_data, title="Value Distribution"):
         """Create a small histogram subplot with percentile-based range"""
@@ -504,7 +598,8 @@ class DenoiseWindow(tk.Toplevel):
                 'psd_fig': psd_fig, 'psd_ax': psd_ax, 'psd_canvas': psd_canvas,
                 'snr_psd_label': snr_psd_label,
                 'gt_snr_label': gt_snr_label, 'gt_psd_snr_label': gt_psd_snr_label, 'gt_rmse_label': gt_rmse_label, 'gt_psnr_label': gt_psnr_label,
-                'gt_metrics_frame': gt_metrics_frame
+                'gt_metrics_frame': gt_metrics_frame,
+                'metrics': {}
             }
             self.result_widgets.append(widget_info)
             return
@@ -531,7 +626,8 @@ class DenoiseWindow(tk.Toplevel):
             'psd_fig': psd_fig, 'psd_ax': psd_ax, 'psd_canvas': psd_canvas,
             'snr_psd_label': snr_psd_label,
             'gt_snr_label': gt_snr_label, 'gt_psd_snr_label': gt_psd_snr_label, 'gt_rmse_label': gt_rmse_label, 'gt_psnr_label': gt_psnr_label,
-            'gt_metrics_frame': gt_metrics_frame
+            'gt_metrics_frame': gt_metrics_frame,
+            'metrics': {}
         }
         self.result_widgets.append(widget_info)
 
@@ -677,14 +773,22 @@ class DenoiseWindow(tk.Toplevel):
                 try:
                     n_scales = int(self.starlet_n_scales_var.get())
                     k = float(self.starlet_k_var.get())
+                    starlet_sigma_str = self.starlet_sigma_var.get().strip()
+                    if starlet_sigma_str:
+                        starlet_sigma_val = float(starlet_sigma_str)
+                        # Adjust sigma based on the percentile scaling factor used
+                        starlet_sigma_adjusted = starlet_sigma_val / self.scale_factor if self.rescale_var.get() else starlet_sigma_val
+                    else:
+                        starlet_sigma_adjusted = None # Estimate if empty
                 except ValueError:
                     n_scales = 4
                     k = 3.0
-                    print("Using default Starlet parameters due to invalid input")
+                    starlet_sigma_adjusted = None # Estimate on error
+                    print("Using default Starlet parameters (or estimating sigma) due to invalid input")
 
                 # Apply Starlet to the *potentially scaled* data 'arr'
-                # Sigma is estimated internally by default if not provided
-                den_scaled = starlet.apply_starlet_denoising(arr, n_scales=n_scales, k=k)
+                print(f"Applying Starlet: n_scales={n_scales}, k={k}, sigma={starlet_sigma_adjusted if starlet_sigma_adjusted is not None else 'auto'})")
+                den_scaled = starlet.apply_starlet_denoising(arr, n_scales=n_scales, k=k, sigma=starlet_sigma_adjusted)
                 
                 # Maintain consistent scaling approach
                 if self.rescale_var.get():
@@ -814,18 +918,44 @@ class DenoiseWindow(tk.Toplevel):
         if self.tv_var.get():
             try:
                 # Parse Total Variation parameters
-                try:
-                    weight = float(self.tv_weight_var.get())
-                    method = self.tv_method_var.get()
-                    max_iter = int(self.tv_max_iter_var.get())
-                except ValueError:
-                    weight = 0.1
-                    method = 'chambolle'
-                    max_iter = 200
-                    print("Using default Total Variation parameters due to invalid input")
+                tv_sigma_str = self.tv_sigma_var.get().strip()
+                tv_c_str = self.tv_c_var.get().strip()
+                max_iter = int(self.tv_max_iter_var.get())
+
+                if not tv_sigma_str:
+                    tkinter.messagebox.showerror("TV Error", "Sigma (Noise STD) must be provided for Total Variation.")
+                    self.show_result("Total Variation", None, display_data_original)
+                    self.update_all_metrics()
+                    return # Skip TV processing
                 
+                try:
+                    tv_sigma_val = float(tv_sigma_str)
+                    tv_c_val = float(tv_c_str)
+                except ValueError:
+                    tkinter.messagebox.showerror("TV Error", "Invalid numeric value for TV Sigma or C_tv.")
+                    self.show_result("Total Variation", None, display_data_original)
+                    self.update_all_metrics()
+                    return
+
+                if tv_sigma_val <= 0:
+                    tkinter.messagebox.showerror("TV Error", "TV Sigma (Noise STD) must be positive.")
+                    self.show_result("Total Variation", None, display_data_original)
+                    self.update_all_metrics()
+                    return
+                if tv_c_val <= 0:
+                    tkinter.messagebox.showerror("TV Error", "TV C_tv (multiplier) must be positive for Weight to be positive.")
+                    self.show_result("Total Variation", None, display_data_original)
+                    self.update_all_metrics()
+                    return
+                
+                # Adjust sigma based on the percentile scaling factor used for the image data `arr`
+                sigma_adjusted_for_weight_calc = tv_sigma_val / self.scale_factor if self.rescale_var.get() else tv_sigma_val
+                
+                weight = tv_c_val * sigma_adjusted_for_weight_calc
+                
+                print(f"Applying Total Variation (ROF): User Sigma={tv_sigma_val:.4f}, C_tv={tv_c_val:.2f}, Calculated Weight={weight:.4f}, Max Iter={max_iter}")
                 # Apply Total Variation to the *potentially scaled* data 'arr'
-                den_scaled = total_variation.tv_denoise(arr, weight=weight, method=method, max_iter=max_iter)
+                den_scaled = total_variation.tv_denoise(arr, weight=weight, max_iter=max_iter)
                 
                 # Maintain consistent scaling approach
                 if self.rescale_var.get():
@@ -850,36 +980,69 @@ class DenoiseWindow(tk.Toplevel):
             try:
                 patch_size = int(self.nlm_patch_size_var.get())
                 patch_distance = int(self.nlm_patch_distance_var.get())
-                h_param = float(self.nlm_h_var.get())
+                
+                nlm_sigma_str = self.nlm_sigma_var.get().strip()
+                nlm_c_str = self.nlm_c_var.get().strip()
+
+                if not nlm_sigma_str:
+                    tkinter.messagebox.showerror("NLM Error", "Sigma (Noise STD) must be provided for NLM.")
+                    self.show_result("NLM Denoise", None, display_data_original) # Show empty panel
+                    self.update_all_metrics() # Update other panels if NLM is skipped
+                    return # Skip NLM processing for this image if sigma is missing
+
+                try:
+                    nlm_sigma_val = float(nlm_sigma_str)
+                    nlm_c_val = float(nlm_c_str)
+                except ValueError:
+                    tkinter.messagebox.showerror("NLM Error", "Invalid numeric value for NLM Sigma or C.")
+                    self.show_result("NLM Denoise", None, display_data_original)
+                    self.update_all_metrics()
+                    return
+
+                if nlm_sigma_val <= 0:
+                    tkinter.messagebox.showerror("NLM Error", "NLM Sigma (Noise STD) must be positive.")
+                    self.show_result("NLM Denoise", None, display_data_original)
+                    self.update_all_metrics()
+                    return
+                if nlm_c_val <= 0:
+                    tkinter.messagebox.showerror("NLM Error", "NLM C (multiplier) must be positive for h to be positive.")
+                    self.show_result("NLM Denoise", None, display_data_original)
+                    self.update_all_metrics()
+                    return
+                
+                # Adjust sigma based on the percentile scaling factor used for the image data `arr`
+                sigma_adjusted_for_h_calc = nlm_sigma_val / self.scale_factor if self.rescale_var.get() else nlm_sigma_val
+                
+                h_param = nlm_c_val * sigma_adjusted_for_h_calc
+
                 if patch_size <= 0 or patch_distance <= 0 or h_param <= 0:
-                    raise ValueError("NLM parameters must be positive.")
-            except ValueError as e_param_parse:
-                print(f"Invalid NLM parameters: {e_param_parse}. Using defaults.")
-                patch_size = 7
-                patch_distance = 10
-                h_param = 0.1
-                self.nlm_patch_size_var.set(str(patch_size))
-                self.nlm_patch_distance_var.set(str(patch_distance))
-                self.nlm_h_var.set(str(h_param))
-                # Proceed with defaults if parsing failed
+                    # This check for h_param might be redundant if nlm_c_val and nlm_sigma_val are checked >0
+                    # but good for safety.
+                    tkinter.messagebox.showerror("NLM Error", "NLM Patch Size, Patch Distance, and calculated h (C*Sigma) must be positive.")
+                    self.show_result("NLM Denoise", None, display_data_original)
+                    self.update_all_metrics()
+                    return
+
+            except ValueError as e_param_parse: # General catch for int conversion of patch_size/distance
+                print(f"Invalid NLM parameters (patch_size/distance): {e_param_parse}")
+                tkinter.messagebox.showerror("NLM Error", f"Invalid NLM parameters (patch_size/distance): {e_param_parse}")
+                self.show_result("NLM Denoise", None, display_data_original)
+                self.update_all_metrics()
+                return # Skip NLM
 
             # --- Start of threaded NLM execution ---
-            print(f"Starting NLM Denoise with patch_size={patch_size}, patch_distance={patch_distance}, h={h_param}...")
+            print(f"Starting NLM Denoise with patch_size={patch_size}, patch_distance={patch_distance}, User Sigma={nlm_sigma_val:.4f}, C={nlm_c_val:.2f}, Calculated h={h_param:.4f}")
             self.show_nlm_processing_dialog()
 
             self.nlm_result_queue = queue.Queue()
-            # Pass a copy of arr to be safe, especially if arr might be a view or shared.
-            # NLM itself pads, creating internal copies for that, but this is an extra precaution.
             arr_copy_for_nlm = arr.copy()
 
-            # Define the progress callback for NLM
             def nlm_gui_progress_callback(percentage):
                 if hasattr(self, 'nlm_progress_win') and self.nlm_progress_win.winfo_exists():
-                    # Schedule the GUI update in the main Tkinter thread
                     self.nlm_progress_win.after(0, self.update_nlm_progress, percentage)
 
             nlm_args = (arr_copy_for_nlm, patch_size, patch_distance, h_param)
-            nlm_kwargs = {'progress_callback': nlm_gui_progress_callback, 'debug': True} # Pass callback and debug
+            nlm_kwargs = {'progress_callback': nlm_gui_progress_callback, 'debug': True}
 
             def nlm_worker_thread():
                 try:
@@ -898,6 +1061,12 @@ class DenoiseWindow(tk.Toplevel):
 
         # After all results are shown and widgets created, update their plots
         self.update_all_metrics() # This will now calculate and plot PSDs
+
+        # Enable summary buttons
+        if self.summary_plots_btn.winfo_exists():
+            self.summary_plots_btn.config(state=tk.NORMAL)
+        if self.export_csv_btn.winfo_exists():
+            self.export_csv_btn.config(state=tk.NORMAL)
 
         # Update scrollregion after populating results_frame
         self.results_frame.update_idletasks() # Ensure results_frame's size is calculated
@@ -925,6 +1094,7 @@ class DenoiseWindow(tk.Toplevel):
         # Clear previous selection visuals and state
         self.clear_all_selections()
         self.selection_coords = None
+        self.clear_coord_entry_boxes() # Clear entry boxes when starting a new selection
 
         # Store start position relative to the canvas clicked
         self.select_start_pos = (event.widget, event.x, event.y)
@@ -1004,8 +1174,10 @@ class DenoiseWindow(tk.Toplevel):
         # Store final selection if area is valid (e.g., > 1 pixel)
         if x1 > x0 and y1 > y0:
             self.selection_coords = (x0, y0, x1, y1)
+            self.update_coord_entry_boxes() # Update entry boxes with new coords
         else:
             self.selection_coords = None # Treat clicks or tiny drags as reset
+            self.clear_coord_entry_boxes() # Clear entry boxes
 
         # Clear the temporary rectangle drawn during drag
         self.clear_all_selections() # Clear temporary rect
@@ -1040,6 +1212,98 @@ class DenoiseWindow(tk.Toplevel):
                 x0, y0, x1, y1, outline="lime", width=1 # Use lime for persistent
             )
             widget_info['rect_id'] = rect_id
+
+    # ==================== Manual Region Input ========================
+
+    def apply_manual_region(self):
+        """Applies the manually entered image pixel coordinates."""
+        try:
+            if self.image_data is None:
+                tkinter.messagebox.showerror("Error", "No image data available to determine dimensions.")
+                return
+
+            x0_str = self.x0_var.get().strip()
+            y0_str = self.y0_var.get().strip()
+            x1_str = self.x1_var.get().strip()
+            y1_str = self.y1_var.get().strip()
+
+            # If all are empty, it's a clear operation
+            if not any([x0_str, y0_str, x1_str, y1_str]):
+                self.clear_manual_region()
+                return
+
+            # If some but not all are empty, it's an error
+            if not all([x0_str, y0_str, x1_str, y1_str]):
+                tkinter.messagebox.showerror("Invalid Input", "All coordinate fields must be filled.")
+                return
+
+            dx0 = int(x0_str)
+            dy0 = int(y0_str)
+            dx1 = int(x1_str)
+            dy1 = int(y1_str)
+
+            # Basic validation against image data dimensions
+            data_h, data_w = self.image_data.shape
+            if not (0 <= dx0 < dx1 <= data_w and 0 <= dy0 < dy1 <= data_h):
+                tkinter.messagebox.showerror(
+                    "Invalid Coordinates",
+                    f"Coordinates must be within the image dimensions ({data_w}x{data_h}) "
+                    "and define a valid rectangle (x0 < x1, y0 < y1)."
+                )
+                return
+
+            # Convert valid data coordinates to preview coordinates
+            preview_coords = self.map_data_coords_to_preview_coords((dx0, dy0, dx1, dy1), self.image_data.shape)
+
+            if not preview_coords:
+                tkinter.messagebox.showerror("Error", "Could not map data coordinates to preview coordinates.")
+                return
+
+            # Clear any mouse-dragged selection state
+            self.select_start_pos = None
+
+            # Set the selection coordinates (these must be preview coords for drawing)
+            self.selection_coords = preview_coords
+
+            # Update visuals and metrics
+            self.draw_all_selections()
+            self.update_all_metrics()
+
+            # Update entry boxes to reflect potentially rounded/clamped values from the conversion
+            self.update_coord_entry_boxes()
+
+        except ValueError:
+            tkinter.messagebox.showerror("Invalid Input", "Coordinates must be integer values.")
+        except Exception as e:
+            tkinter.messagebox.showerror("Error", f"An error occurred: {e}")
+    
+    def clear_manual_region(self):
+        """Clears the manual coordinate boxes and the selection."""
+        self.clear_coord_entry_boxes()
+        self.selection_coords = None
+        self.clear_all_selections()
+        self.update_all_metrics()
+
+    def update_coord_entry_boxes(self):
+        """Updates the coordinate entry boxes with the data coordinates of the current selection."""
+        if self.selection_coords and self.image_data is not None:
+            # self.selection_coords are in preview space, convert them to data space for display
+            data_coords = self.map_preview_coords_to_data_coords(self.selection_coords, self.image_data.shape)
+            if data_coords:
+                dx0, dy0, dx1, dy1 = data_coords
+                self.x0_var.set(str(dx0))
+                self.y0_var.set(str(dy0))
+                self.x1_var.set(str(dx1))
+                self.y1_var.set(str(dy1))
+        else:
+            self.clear_coord_entry_boxes()
+
+    def clear_coord_entry_boxes(self):
+        """Clears the coordinate entry boxes."""
+        self.x0_var.set("")
+        self.y0_var.set("")
+        self.x1_var.set("")
+        self.y1_var.set("")
 
     # ==================== PSD Calculation and Display ====================
 
@@ -1088,21 +1352,21 @@ class DenoiseWindow(tk.Toplevel):
         # Calculate radial distance (spatial frequency magnitude) for each pixel
         k_radial = np.sqrt(kx**2 + ky**2)
 
-        # Define number of bins for radial averaging - MUCH FINER RESOLUTION
-        # Use a high number of bins for better frequency resolution
+        # Define number of bins for radial averaging - BALANCED RESOLUTION
+        # Use a moderate number of bins for good frequency resolution without being excessive
         max_freq = np.max(k_radial)
         
-        # Set minimum number of bins for fine resolution
-        min_bins = 200  # Much higher than before
+        # Set minimum number of bins for reasonable resolution
+        min_bins = 80  # Balanced: not too few, not too many
         
-        # Calculate based on image size but ensure we have at least min_bins
-        size_based_bins = min(h, w) * 2  # More bins relative to image size
+        # Calculate based on image size but more conservative than before
+        size_based_bins = min(h, w)  # One bin per pixel dimension (more reasonable than *2)
         
         # Use the larger of the two approaches
         num_bins = max(min_bins, size_based_bins)
         
-        # Cap at reasonable maximum for performance (but much higher than before)
-        max_bins = 1000
+        # Cap at reasonable maximum for performance
+        max_bins = 300  # Much lower than 1000 but still good resolution
         num_bins = min(num_bins, max_bins)
 
         if num_bins < 1:
@@ -1164,6 +1428,34 @@ class DenoiseWindow(tk.Toplevel):
 
         return dx0, dy0, dx1, dy1
 
+    def map_data_coords_to_preview_coords(self, data_coords, data_shape):
+        """Convert data indices (dx0,dy0,dx1,dy1) to preview coords (px0,py0,px1,py1)."""
+        if not data_coords or not data_shape:
+            return None
+
+        dx0, dy0, dx1, dy1 = data_coords
+        data_h, data_w = data_shape
+
+        # Prevent division by zero if data shape is invalid
+        if data_w == 0 or data_h == 0:
+            return 0, 0, self.preview_size, self.preview_size
+
+        scale_x = self.preview_size / data_w
+        scale_y = self.preview_size / data_h
+
+        px0 = max(0, int(round(dx0 * scale_x)))
+        py0 = max(0, int(round(dy0 * scale_y)))
+        px1 = min(self.preview_size, int(round(dx1 * scale_x)))
+        py1 = min(self.preview_size, int(round(dy1 * scale_y)))
+        
+        # Ensure indices define a valid, non-empty region on the preview
+        if px1 <= px0: px1 = px0 + 1
+        if py1 <= py0: py1 = py0 + 1
+        px1 = min(self.preview_size, px1)
+        py1 = min(self.preview_size, py1)
+
+        return px0, py0, px1, py1
+
     def update_all_metrics(self):
         """Recalculate and update metrics display (PSD plots) for all result widgets."""
         # Determine the title of the image to use as the PSD reference
@@ -1216,6 +1508,8 @@ class DenoiseWindow(tk.Toplevel):
         gt_rmse_label = widget_info['gt_rmse_label']
         gt_psnr_label = widget_info['gt_psnr_label']
         gt_metrics_frame = widget_info.get('gt_metrics_frame')
+
+        widget_info['metrics'] = {} # Reset metrics for this update cycle
 
         if image_data is None:
             psd_ax.clear()
@@ -1292,6 +1586,11 @@ class DenoiseWindow(tk.Toplevel):
         # --- Calculate and Display Single Value Metrics ---
         try:
             snr_metrics = noise_analysis.estimate_snr_psd(data_slice)
+            if snr_metrics:
+                # Prefix with 'est_' for estimated
+                widget_info['metrics']['est_snr_db'] = snr_metrics.get('snr_db')
+                widget_info['metrics']['est_noise_rms'] = snr_metrics.get('noise_rms')
+                widget_info['metrics']['est_signal_rms'] = snr_metrics.get('signal_rms')
             if snr_metrics and snr_metrics['snr_db'] is not None and not np.isnan(snr_metrics['snr_db']):
                 snr_psd_label.config(text=f"SNR - PSD (estimation): {snr_metrics['snr_db']:.2f} dB")
             else:
@@ -1323,6 +1622,7 @@ class DenoiseWindow(tk.Toplevel):
                 
                 # Use our custom calculator instead of noise_analysis.calculate_snr_with_ground_truth
                 gt_metrics = self.calculate_ground_truth_metrics(data_slice, clean_slice)
+                widget_info['metrics'].update(gt_metrics)
                 
                 # DEBUG: Print the calculated metrics
                 print(f"Signal power: {gt_metrics.get('signal_power', 'N/A'):.6e}")
@@ -1373,6 +1673,35 @@ class DenoiseWindow(tk.Toplevel):
                 gt_psd_snr_label.config(text="SNR - PSD: Error")
                 gt_psnr_label.config(text="PSNR: Error")
                 gt_rmse_label.config(text="RMSE: Error")
+            
+        # if no clean data, calculate residual metrics against original image
+        elif self.clean_image_data is None and title != self.noisy_image_display_title:
+            try:
+                # Find original noisy image data
+                original_widget = next((w for w in self.result_widgets if w['title'] == self.noisy_image_display_title), None)
+                if original_widget and original_widget['data'] is not None:
+                    original_full_data = original_widget['data']
+                    
+                    # Get corresponding slice from original data
+                    original_data_slice = None
+                    if data_coords:
+                        dx0, dy0, dx1, dy1 = data_coords
+                        if dx1 <= original_full_data.shape[1] and dy1 <= original_full_data.shape[0]:
+                            original_data_slice = original_full_data[dy0:dy1, dx0:dx1]
+                        else:
+                            original_data_slice = original_full_data
+                    else:
+                        original_data_slice = original_full_data
+                    
+                    if original_data_slice.shape == data_slice.shape:
+                        residual = original_data_slice - data_slice
+                        # Use a function to calculate metrics from residual
+                        residual_metrics = self.calculate_residual_only_metrics(residual)
+                        # Prefix to avoid collision with GT metrics
+                        prefixed_metrics = {f"resid_{k}": v for k, v in residual_metrics.items() if v is not None}
+                        widget_info['metrics'].update(prefixed_metrics)
+            except Exception as e:
+                print(f"Error calculating residual metrics for {title}{region_label_psd}: {e}")
             
         # Update histogram for the selected region if selection exists
         hist_title = f"Value Distribution{region_label_psd}"
@@ -2233,6 +2562,411 @@ class DenoiseWindow(tk.Toplevel):
                 self.nlm_progress_win.grab_release()
                 self.nlm_progress_win.destroy()
             tkinter.messagebox.showerror("NLM Check Error", f"Error processing NLM result: {str(e_check)}")
+
+    def generate_summary_plots(self):
+        # New Toplevel window
+        summary_window = tk.Toplevel(self)
+        summary_window.title("Summary Plots")
+        summary_window.geometry("1200x800")
+
+        notebook = ttk.Notebook(summary_window)
+        notebook.pack(expand=True, fill='both', padx=10, pady=10)
+
+        source_image_frame = ttk.Frame(notebook)
+        psd_frame = ttk.Frame(notebook)
+        horiz_psd_frame = ttk.Frame(notebook)
+        hist_frame = ttk.Frame(notebook)
+        residual_frame = ttk.Frame(notebook)
+
+        notebook.add(source_image_frame, text="Region Under Study")
+        notebook.add(psd_frame, text="Radially Averaged PSD")
+        notebook.add(horiz_psd_frame, text="Center Horizontal PSD")
+        notebook.add(hist_frame, text="Histograms")
+        notebook.add(residual_frame, text="Residual Images")
+
+        # Determine if a region is selected and get its coordinates and label
+        region_label = " (Global)"
+        data_coords = None
+        
+        # Find a reference widget to get the data shape for coordinate mapping
+        plot_data = self._get_plot_data()
+        ref_widget = plot_data.get('noisy') or plot_data.get('clean') or (plot_data.get('denoised')[0] if plot_data.get('denoised') else None)
+        
+        if ref_widget and ref_widget.get('data') is not None:
+             data_coords = self.map_preview_coords_to_data_coords(self.selection_coords, ref_widget['data'].shape)
+        
+        if data_coords:
+            dx0, dy0, dx1, dy1 = data_coords
+            region_label = f" (Region {dx0}:{dx1},{dy0}:{dy1})"
+
+        # Create the plots, passing the regional information
+        self._create_summary_source_image_plot(source_image_frame, data_coords, region_label)
+        self._create_summary_psd_plot(psd_frame, data_coords, region_label)
+        self._create_summary_center_horizontal_psd_plot(horiz_psd_frame, data_coords, region_label)
+        self._create_summary_hist_plot(hist_frame, data_coords, region_label)
+        self._create_summary_residual_plot(residual_frame, data_coords, region_label)
+
+    def _get_plot_data(self):
+        plot_data = {'clean': None, 'noisy': None, 'denoised': []}
+        for widget_info in self.result_widgets:
+            if widget_info['title'] == 'Clean Reference':
+                plot_data['clean'] = widget_info
+            elif widget_info['title'] == self.noisy_image_display_title:
+                plot_data['noisy'] = widget_info
+            else:
+                if widget_info['data'] is not None:
+                    plot_data['denoised'].append(widget_info)
+        return plot_data
+
+    def _create_summary_psd_plot(self, parent_frame, data_coords, region_label):
+        fig = Figure(figsize=(10, 7), dpi=100)
+        ax = fig.add_subplot(111)
+
+        plot_data = self._get_plot_data()
+        
+        data_to_plot = []
+        if plot_data.get('clean'): data_to_plot.append(plot_data['clean'])
+        if plot_data.get('noisy'): data_to_plot.append(plot_data['noisy'])
+        data_to_plot.extend(plot_data.get('denoised', []))
+
+        for item in data_to_plot:
+            image_data = item['data']
+            if image_data is not None:
+                # Use slice if region is selected
+                data_slice = image_data
+                if data_coords:
+                    dx0, dy0, dx1, dy1 = data_coords
+                    if dy1 <= image_data.shape[0] and dx1 <= image_data.shape[1]:
+                        data_slice = image_data[dy0:dy1, dx0:dx1]
+
+                freqs, psd = self.calculate_radial_psd(data_slice)
+                if freqs is not None and psd is not None:
+                    ax.plot(freqs, psd, label=item['title'], linewidth=1)
+        
+        ax.set_yscale('log')
+        ax.set_title(f"Radially Averaged Power Spectral Density{region_label}")
+        ax.set_xlabel("Spatial Frequency")
+        ax.set_ylabel("Avg. Power (log)")
+        ax.grid(True, which='both', linestyle='--', linewidth=0.5, alpha=0.5)
+        ax.legend()
+        fig.tight_layout()
+
+        canvas = FigureCanvasTkAgg(fig, master=parent_frame)
+        canvas.draw()
+        
+        toolbar = NavigationToolbar2Tk(canvas, parent_frame)
+        toolbar.update()
+        
+        toolbar.pack(side=tk.BOTTOM, fill=tk.X)
+        canvas.get_tk_widget().pack(fill='both', expand=True)
+    
+    def _create_summary_center_horizontal_psd_plot(self, parent_frame, data_coords, region_label):
+        fig = Figure(figsize=(10, 7), dpi=100)
+        ax = fig.add_subplot(111)
+
+        plot_data = self._get_plot_data()
+        
+        data_to_plot = []
+        if plot_data.get('clean'): data_to_plot.append(plot_data['clean'])
+        if plot_data.get('noisy'): data_to_plot.append(plot_data['noisy'])
+        data_to_plot.extend(plot_data.get('denoised', []))
+
+        for item in data_to_plot:
+            image_data = item['data']
+            if image_data is not None:
+                # Use slice if region is selected
+                data_slice = image_data
+                if data_coords:
+                    dx0, dy0, dx1, dy1 = data_coords
+                    if dy1 <= image_data.shape[0] and dx1 <= image_data.shape[1]:
+                        data_slice = image_data[dy0:dy1, dx0:dx1]
+
+                freqs, psd = self.calculate_center_horizontal_psd(data_slice)
+                if freqs is not None and psd is not None:
+                    ax.plot(freqs, psd, label=item['title'], linewidth=1)
+        
+        ax.set_yscale('log')
+        ax.set_title(f"Center Horizontal Line Power Spectral Density{region_label}")
+        ax.set_xlabel("Spatial Frequency")
+        ax.set_ylabel("Power (log)")
+        ax.grid(True, which='both', linestyle='--', linewidth=0.5, alpha=0.5)
+        ax.legend()
+        fig.tight_layout()
+
+        canvas = FigureCanvasTkAgg(fig, master=parent_frame)
+        canvas.draw()
+        
+        toolbar = NavigationToolbar2Tk(canvas, parent_frame)
+        toolbar.update()
+        
+        toolbar.pack(side=tk.BOTTOM, fill=tk.X)
+        canvas.get_tk_widget().pack(fill='both', expand=True)
+    
+    def _create_summary_hist_plot(self, parent_frame, data_coords, region_label):
+        fig = Figure(figsize=(10, 7), dpi=100)
+        ax = fig.add_subplot(111)
+
+        plot_data = self._get_plot_data()
+
+        data_to_plot = []
+        if plot_data.get('clean'): data_to_plot.append(plot_data['clean'])
+        if plot_data.get('noisy'): data_to_plot.append(plot_data['noisy'])
+        data_to_plot.extend(plot_data.get('denoised', []))
+        
+        for item in data_to_plot:
+            image_data = item['data']
+            if image_data is not None:
+                # Use slice if region is selected
+                data_slice = image_data
+                if data_coords:
+                    dx0, dy0, dx1, dy1 = data_coords
+                    if dy1 <= image_data.shape[0] and dx1 <= image_data.shape[1]:
+                        data_slice = image_data[dy0:dy1, dx0:dx1]
+                
+                p1, p99 = np.percentile(data_slice, (1, 99))
+                if p99 - p1 < 1e-8:
+                    p1, p99 = np.min(data_slice), np.max(data_slice)
+                ax.hist(data_slice.ravel(), bins=100, density=True, alpha=0.5, label=item['title'], range=(p1, p99))
+
+        ax.set_title(f"Image Histograms (1-99th percentile){region_label}")
+        ax.set_xlabel("Pixel Value")
+        ax.set_ylabel("Density")
+        ax.legend()
+        fig.tight_layout()
+
+        canvas = FigureCanvasTkAgg(fig, master=parent_frame)
+        canvas.draw()
+
+        toolbar = NavigationToolbar2Tk(canvas, parent_frame)
+        toolbar.update()
+
+        toolbar.pack(side=tk.BOTTOM, fill=tk.X)
+        canvas.get_tk_widget().pack(fill='both', expand=True)
+
+    def _create_summary_residual_plot(self, parent_frame, data_coords, region_label):
+        # Create a scrollable canvas setup within the parent frame (the notebook tab)
+        scroll_canvas = tk.Canvas(parent_frame)
+        scrollbar = ttk.Scrollbar(parent_frame, orient="vertical", command=scroll_canvas.yview)
+        scrollable_frame = ttk.Frame(scroll_canvas)
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: scroll_canvas.configure(
+                scrollregion=scroll_canvas.bbox("all")
+            )
+        )
+
+        scroll_canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        scroll_canvas.configure(yscrollcommand=scrollbar.set)
+
+        plot_data = self._get_plot_data()
+        
+        # Get full data first
+        clean_full_data = plot_data['clean']['data'] if plot_data.get('clean') else None
+        noisy_full_data = plot_data['noisy']['data'] if plot_data.get('noisy') else None
+        
+        if clean_full_data is None:
+            ttk.Label(parent_frame, text="Residual plots require a clean reference image.").pack()
+            return
+
+        # Function to get slice or full data
+        def get_slice(full_data):
+            if full_data is None: return None
+            if data_coords:
+                dx0, dy0, dx1, dy1 = data_coords
+                if dy1 <= full_data.shape[0] and dx1 <= full_data.shape[1]:
+                    return full_data[dy0:dy1, dx0:dx1]
+            return full_data # Return full data if no coords or mismatch
+
+        clean_data = get_slice(clean_full_data)
+        noisy_data = get_slice(noisy_full_data)
+        
+        residuals_to_plot = []
+        
+        # Ground truth noise: Noisy - Clean (if clean is available)
+        if noisy_data is not None and clean_data is not None:
+            if noisy_data.shape == clean_data.shape:
+                 residuals_to_plot.append({'title': 'Noisy - Clean (Ground Truth Noise)', 'data': noisy_data - clean_data})
+        
+        # What each filter removed: Noisy - Denoised
+        if noisy_data is not None:
+            for item in plot_data.get('denoised', []):
+                denoised_full_data = item['data']
+                denoised_data = get_slice(denoised_full_data)
+                if denoised_data is not None and noisy_data.shape == denoised_data.shape:
+                    residuals_to_plot.append({'title': f"Noisy - {item['title']} (Removed Component)", 'data': noisy_data - denoised_data})
+
+        if not residuals_to_plot:
+            # Pack label into parent_frame directly if no plots
+            ttk.Label(parent_frame, text=f"No valid residuals to display for the selected region.").pack()
+            return
+
+        # Vertical layout: 1 column, num_residuals rows
+        cols = 1
+        rows = len(residuals_to_plot)
+
+        # Adjust figure height based on number of plots to make them readable
+        fig_height = 4 * rows 
+        fig_width = 8
+        fig = Figure(figsize=(fig_width, fig_height), dpi=100)
+
+        for i, res_item in enumerate(residuals_to_plot):
+            ax = fig.add_subplot(rows, cols, i + 1)
+            residual_image = res_item['data']
+            
+            # Use minmax scaling for residual display
+            disp_img = create_display_image(residual_image, method='minmax')
+            
+            im = ax.imshow(disp_img, cmap='gray', aspect='auto')
+            ax.set_title(res_item['title'], fontsize=10)
+            ax.axis('off')
+            fig.colorbar(im, ax=ax)
+
+        fig.tight_layout(pad=3.0)
+
+        # The Matplotlib canvas goes into the scrollable_frame, not the parent_frame
+        canvas = FigureCanvasTkAgg(fig, master=scrollable_frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill='both', expand=True)
+
+        # The toolbar goes in the parent frame, below the scrollable area
+        toolbar = NavigationToolbar2Tk(canvas, parent_frame)
+        toolbar.update()
+        
+        # Now pack everything into parent_frame
+        toolbar.pack(side="bottom", fill="x")
+        scroll_canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+    def export_metrics_to_csv(self):
+        from tkinter import filedialog
+        import datetime
+
+        filepath = filedialog.asksaveasfilename(
+            title="Save Metrics to CSV",
+            defaultextension=".csv",
+            initialfile="denoising_metrics.csv",
+            filetypes=[("CSV files", "*.csv")]
+        )
+
+        if not filepath:
+            return
+
+        # --- Gather all data and headers ---
+        all_metrics_data = []
+        all_headers = set(['Algorithm'])
+
+        for widget_info in self.result_widgets:
+            # We only export for images that have data.
+            if widget_info['data'] is not None:
+                # Get metrics. They are calculated for the current selection (region or global).
+                # update_all_metrics() ensures they are up-to-date.
+                metrics = widget_info.get('metrics', {})
+                # Filter out non-scalar metrics
+                scalar_metrics = {k: v for k, v in metrics.items() if not isinstance(v, np.ndarray)}
+                
+                # Create a row for the CSV
+                row_data = {'Algorithm': widget_info['title']}
+                row_data.update(scalar_metrics)
+                all_metrics_data.append(row_data)
+                
+                # Update headers
+                all_headers.update(scalar_metrics.keys())
+
+        if not all_metrics_data:
+            tkinter.messagebox.showinfo("No Data", "No metrics available to export.")
+            return
+
+        # --- Write to CSV ---
+        # Sort headers for consistent column order. 'Algorithm' first.
+        sorted_headers = ['Algorithm'] + sorted([h for h in all_headers if h != 'Algorithm'])
+
+        try:
+            with open(filepath, 'w', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=sorted_headers)
+                writer.writeheader()
+                for row_data in all_metrics_data:
+                    # Fill missing values with empty string
+                    writer.writerow({h: row_data.get(h, '') for h in sorted_headers})
+            
+            tkinter.messagebox.showinfo("Export Successful", f"Metrics saved to {filepath}")
+        except Exception as e:
+            tkinter.messagebox.showerror("Export Error", f"Error saving metrics to CSV: {str(e)}")
+
+    def _create_summary_source_image_plot(self, parent_frame, data_coords, region_label):
+        fig = Figure(figsize=(10, 7), dpi=100)
+        ax = fig.add_subplot(111)
+
+        plot_data = self._get_plot_data()
+        
+        # We'll use the "noisy" or "original" image as the reference
+        source_image_widget = plot_data.get('noisy')
+        if not source_image_widget or source_image_widget.get('data') is None:
+             # Fallback to clean if noisy isn't available
+             source_image_widget = plot_data.get('clean')
+
+        if not source_image_widget or source_image_widget.get('data') is None:
+            ax.text(0.5, 0.5, "Source Image Not Available", ha='center', va='center')
+            ax.set_title("Region Under Study")
+        else:
+            source_image_data = source_image_widget['data']
+            
+            # Display image with correct aspect ratio
+            ax.imshow(source_image_data, cmap='gray', aspect='equal')
+            ax.set_title(f"{source_image_widget['title']}{region_label}")
+
+            # If a region is selected, draw a rectangle on it
+            if data_coords:
+                dx0, dy0, dx1, dy1 = data_coords
+                rect_width = dx1 - dx0
+                rect_height = dy1 - dy0
+                
+                # Create a Rectangle patch
+                rect = patches.Rectangle(
+                    (dx0, dy0), rect_width, rect_height,
+                    linewidth=1.5, edgecolor='lime', facecolor='none'
+                )
+                
+                # Add the patch to the Axes
+                ax.add_patch(rect)
+
+        fig.tight_layout()
+
+        canvas = FigureCanvasTkAgg(fig, master=parent_frame)
+        canvas.draw()
+        
+        toolbar = NavigationToolbar2Tk(canvas, parent_frame)
+        toolbar.update()
+        
+        toolbar.pack(side=tk.BOTTOM, fill=tk.X)
+        canvas.get_tk_widget().pack(fill='both', expand=True)
+
+    def calculate_center_horizontal_psd(self, image_patch):
+        """
+        Calculates the 1D Power Spectral Density (PSD) of the center
+        horizontal line of an image patch.
+        """
+        if image_patch is None or image_patch.ndim != 2 or min(image_patch.shape) < 2:
+            return None, None
+
+        patch = image_patch.astype(float)
+        h, w = patch.shape
+        
+        # Get the center row
+        center_row_index = h // 2
+        center_row = patch[center_row_index, :]
+
+        frequencies = np.fft.rfftfreq(w, d=1.0) 
+
+        hanning_window = np.hanning(w)
+        row_windowed = center_row * hanning_window
+        
+        f_transform = np.fft.rfft(row_windowed)
+        
+        power_spectrum = np.abs(f_transform)**2
+
+        # Don't plot the DC component (frequency 0)
+        return frequencies[1:], power_spectrum[1:]
 
 
 class ResidualAnalysisPopup(tk.Toplevel):

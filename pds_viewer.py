@@ -753,7 +753,7 @@ class PDSImageViewer(tk.Tk):
         if self.current_image_data is not None:
             # Pass the clean reference image if available (for NPZ files)
             denoise_win = DenoiseWindow(self, image_data=self.current_image_data, clean_image_data=self.clean_image_data)
-            denoise_win.grab_set()  # Make it modal
+            # denoise_win.grab_set()  # Make it modal
         
 def main():
     viewer = PDSImageViewer()

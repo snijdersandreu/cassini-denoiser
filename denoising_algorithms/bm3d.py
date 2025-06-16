@@ -1,6 +1,7 @@
 import numpy as np
 from scipy.fftpack import dct, idct
 import time
+import concurrent.futures
 
 
 def bm3d_denoise(img, sigma=None, stage='all', debug=False, callback=None):
@@ -245,26 +246,66 @@ def _block_matching(img, ref_pos, block_size, window_size, max_blocks, threshold
     return block_positions
 
 
+def _haar_1d(vec):
+    """Apply 1D Haar transform to a 1D numpy array (length must be power of 2)"""
+    n = vec.shape[0]
+    output = vec.copy()
+    temp = np.zeros_like(vec)
+    length = n
+    while length > 1:
+        half = length // 2
+        for i in range(half):
+            temp[i] = (output[2*i] + output[2*i+1]) / np.sqrt(2)
+            temp[half + i] = (output[2*i] - output[2*i+1]) / np.sqrt(2)
+        output[:length] = temp[:length]
+        length //= 2
+    return output
+
+
+def _inverse_haar_1d(vec):
+    """Apply inverse 1D Haar transform to a 1D numpy array (length must be power of 2)"""
+    n = vec.shape[0]
+    output = vec.copy()
+    temp = np.zeros_like(vec)
+    length = 1
+    while length < n:
+        for i in range(length):
+            temp[2*i] = (output[i] + output[length + i]) / np.sqrt(2)
+            temp[2*i+1] = (output[i] - output[length + i]) / np.sqrt(2)
+        output[:2*length] = temp[:2*length]
+        length *= 2
+    return output
+
+
 def _hard_threshold_group(group, sigma, lambda_thr=2.7):
-    """Apply hard thresholding to 3D transformed group"""
+    """Apply hard thresholding to 3D transformed group (true 3D: 2D DCT + 1D Haar)"""
     # 2D DCT on each block
     group_dct = np.zeros_like(group)
     for i in range(group.shape[0]):
         group_dct[i] = _dct_2d(group[i])
     
-    # 1D Haar transform along 3rd dimension
-    # Simple implementation: just reshape, apply transform, reshape back
-    coeffs = np.float64(group_dct.copy())
-    block_size = group_dct.shape[1]
+    # 1D Haar transform along group axis (axis=0)
+    shape = group_dct.shape
+    group_reshaped = group_dct.reshape(shape[0], -1)  # (num_blocks, block_size*block_size)
+    for j in range(group_reshaped.shape[1]):
+        group_reshaped[:, j] = _haar_1d(group_reshaped[:, j])
+    group_3d = group_reshaped.reshape(shape)
     
-    # Threshold
+    # Threshold in 3D domain
     threshold = lambda_thr * sigma
+    coeffs = group_3d
     coeffs[np.abs(coeffs) < threshold] = 0
     
-    # Inverse 3D transform: 1D Haar inverse + 2D IDCT
+    # Inverse 1D Haar along group axis
+    coeffs_reshaped = coeffs.reshape(shape[0], -1)
+    for j in range(coeffs_reshaped.shape[1]):
+        coeffs_reshaped[:, j] = _inverse_haar_1d(coeffs_reshaped[:, j])
+    coeffs_id = coeffs_reshaped.reshape(shape)
+    
+    # Inverse 2D DCT on each block
     group_denoised = np.zeros_like(group)
-    for i in range(coeffs.shape[0]):
-        group_denoised[i] = _idct_2d(coeffs[i])
+    for i in range(coeffs_id.shape[0]):
+        group_denoised[i] = _idct_2d(coeffs_id[i])
     
     # Calculate weight
     weight = 1.0 / (1.0 + np.sum(coeffs != 0))
@@ -273,25 +314,38 @@ def _hard_threshold_group(group, sigma, lambda_thr=2.7):
 
 
 def _wiener_filter_group(noisy_group, basic_group, sigma):
-    """Apply Wiener filtering to 3D group using basic estimate as guide"""
+    """Apply Wiener filtering to 3D group using basic estimate as guide (true 3D: 2D DCT + 1D Haar)"""
     # 2D DCT on each block
     noisy_dct = np.zeros_like(noisy_group)
     basic_dct = np.zeros_like(basic_group)
-    
     for i in range(noisy_group.shape[0]):
         noisy_dct[i] = _dct_2d(noisy_group[i])
         basic_dct[i] = _dct_2d(basic_group[i])
     
-    # Calculate Wiener weights: S²/(S² + σ²)
-    wiener_weights = (basic_dct**2) / (basic_dct**2 + sigma**2)
+    # 1D Haar transform along group axis (axis=0)
+    shape = noisy_dct.shape
+    noisy_reshaped = noisy_dct.reshape(shape[0], -1)
+    basic_reshaped = basic_dct.reshape(shape[0], -1)
+    for j in range(noisy_reshaped.shape[1]):
+        noisy_reshaped[:, j] = _haar_1d(noisy_reshaped[:, j])
+        basic_reshaped[:, j] = _haar_1d(basic_reshaped[:, j])
+    noisy_3d = noisy_reshaped.reshape(shape)
+    basic_3d = basic_reshaped.reshape(shape)
     
-    # Apply Wiener filter
-    filtered_dct = noisy_dct * wiener_weights
+    # Wiener weights in 3D domain
+    wiener_weights = (basic_3d**2) / (basic_3d**2 + sigma**2)
+    filtered_3d = noisy_3d * wiener_weights
     
-    # Inverse 2D DCT
+    # Inverse 1D Haar along group axis
+    filtered_reshaped = filtered_3d.reshape(shape[0], -1)
+    for j in range(filtered_reshaped.shape[1]):
+        filtered_reshaped[:, j] = _inverse_haar_1d(filtered_reshaped[:, j])
+    filtered_id = filtered_reshaped.reshape(shape)
+    
+    # Inverse 2D DCT on each block
     filtered_group = np.zeros_like(noisy_group)
-    for i in range(filtered_dct.shape[0]):
-        filtered_group[i] = _idct_2d(filtered_dct[i])
+    for i in range(filtered_id.shape[0]):
+        filtered_group[i] = _idct_2d(filtered_id[i])
     
     # Calculate weight (proportional to Wiener weights squared sum)
     weight = 1.0 / (1.0 + np.sum(wiener_weights**2))
@@ -322,32 +376,7 @@ def _aggregate_blocks(blocks, weights, positions, output_shape, block_size):
 
 def _process_reference_blocks(img, ref_positions, block_size, sigma, params, is_step2=False, basic_estimate=None, debug=False, callback=None):
     """
-    Process reference blocks sequentially
-    
-    Parameters:
-    -----------
-    img : ndarray
-        Input image
-    ref_positions : list
-        List of (y, x) coordinates for reference blocks
-    block_size : int
-        Size of blocks
-    sigma : float
-        Noise standard deviation
-    params : dict
-        Dictionary of BM3D parameters
-    is_step2 : bool
-        Whether this is step 2 (Wiener) vs step 1 (Hard threshold)
-    basic_estimate : ndarray or None
-        Basic estimate for step 2
-    debug : bool
-        Whether to print debug info
-    callback : callable or None
-        Function to report progress
-        
-    Returns:
-    --------
-    tuple: (all_denoised_blocks, all_weights, all_positions)
+    Process reference blocks in parallel using ThreadPoolExecutor
     """
     max_blocks = params['max_blocks']
     window_size = params['window_size']
@@ -359,19 +388,11 @@ def _process_reference_blocks(img, ref_positions, block_size, sigma, params, is_
     
     total_blocks = len(ref_positions)
     if debug:
-        print(f"Processing {total_blocks} reference blocks...")
-        progress_interval = max(1, total_blocks // 10)  # Show progress at 10% intervals
-    
-    for i, ref_pos in enumerate(ref_positions):
-        # Progress reporting
-        progress = i / total_blocks
-        if callback:
-            callback(progress)
-            
-        # Debug output for progress tracking
-        if debug and i % progress_interval == 0:
-            print(f"  Progress: {i/total_blocks*100:.1f}% ({i}/{total_blocks} blocks)")
-        
+        print(f"Processing {total_blocks} reference blocks (threaded)...")
+        progress_interval = max(1, total_blocks // 10)
+
+    def process_one_block(args):
+        i, ref_pos = args
         # Find similar blocks
         if is_step2:
             similar_positions = _block_matching(
@@ -383,13 +404,11 @@ def _process_reference_blocks(img, ref_positions, block_size, sigma, params, is_
                 img, ref_pos, block_size, window_size, 
                 max_blocks, threshold, is_basic_estimate=False
             )
-        
         # Extract blocks
         noisy_group = np.array([
             img[y:y+block_size, x:x+block_size] 
             for y, x in similar_positions
         ])
-        
         # Apply appropriate filtering
         if is_step2:
             basic_group = np.array([
@@ -398,23 +417,42 @@ def _process_reference_blocks(img, ref_positions, block_size, sigma, params, is_
             ])
             denoised_group, weight = _wiener_filter_group(noisy_group, basic_group, sigma)
         else:
-            # Use the threshold parameter from params if available
             hard_threshold = params.get('hard_threshold', 2.7)
             denoised_group, weight = _hard_threshold_group(noisy_group, sigma, lambda_thr=hard_threshold)
-        
-        # Store results
-        all_denoised_blocks.extend(list(denoised_group))
-        all_weights.extend([weight] * len(similar_positions))
-        all_positions.extend(similar_positions)
-    
+        # Return results for this block
+        return (list(denoised_group), [weight] * len(similar_positions), list(similar_positions), i)
+
+    # Use ThreadPoolExecutor for parallel processing
+    results = [None] * total_blocks
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        futures = {executor.submit(process_one_block, (i, ref_pos)): i for i, ref_pos in enumerate(ref_positions)}
+        for count, future in enumerate(concurrent.futures.as_completed(futures)):
+            i = futures[future]
+            try:
+                blocks, weights, positions, idx = future.result()
+                results[idx] = (blocks, weights, positions)
+            except Exception as exc:
+                if debug:
+                    print(f"Block {i} generated an exception: {exc}")
+                results[i] = ([], [], [])
+            # Progress reporting
+            progress = (count + 1) / total_blocks
+            if callback:
+                callback(progress)
+            if debug and (count + 1) % progress_interval == 0:
+                print(f"  Progress: {(count+1)/total_blocks*100:.1f}% ({count+1}/{total_blocks} blocks)")
+
+    # Aggregate all results
+    for blocks, weights, positions in results:
+        all_denoised_blocks.extend(blocks)
+        all_weights.extend(weights)
+        all_positions.extend(positions)
+
     if debug:
         print(f"  Block processing completed, found {len(all_positions)} positions")
         print(f"  Aggregating results...")
-    
-    # Final progress report
     if callback:
         callback(1.0)
-    
     return all_denoised_blocks, all_weights, all_positions
 
 
