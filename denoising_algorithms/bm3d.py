@@ -4,7 +4,7 @@ import time
 import concurrent.futures
 
 
-def bm3d_denoise(img, sigma=None, stage='all', debug=False, callback=None):
+def bm3d_denoise(img, sigma=None, stage='all', debug=False, callback=None, custom_params=None):
     """
     Block-Matching and 3D filtering (BM3D) for image denoising.
     
@@ -23,6 +23,8 @@ def bm3d_denoise(img, sigma=None, stage='all', debug=False, callback=None):
         Whether to print debug information
     callback : callable, optional
         Function to call to report progress (float from 0.0 to 1.0)
+    custom_params : dict, optional
+        Dictionary of custom parameters to override defaults.
         
     Returns:
     --------
@@ -46,7 +48,7 @@ def bm3d_denoise(img, sigma=None, stage='all', debug=False, callback=None):
         print(f"Using provided noise sigma: {sigma:.4f}")
     
     # Set parameters based on noise level
-    params = _get_bm3d_params(sigma)
+    params = _get_bm3d_params(sigma, custom_params=custom_params)
     if debug:
         print(f"BM3D parameters: {params}")
     

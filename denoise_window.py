@@ -541,6 +541,9 @@ class DenoiseWindow(tk.Toplevel):
             gt_psd_snr_label = ttk.Label(snr_row, text="SNR - PSD: Calc...", font=('Helvetica', 9))
             gt_psd_snr_label.pack(side='left', padx=(0, 10))
             
+            gt_horiz_psd_snr_label = ttk.Label(snr_row, text="SNR - Horiz PSD: Calc...", font=('Helvetica', 9))
+            gt_horiz_psd_snr_label.pack(side='left', padx=(0, 10))
+            
             # Second row: Other metrics
             other_row = ttk.Frame(gt_metrics_frame)
             other_row.pack(fill='x', padx=5, pady=2)
@@ -557,6 +560,7 @@ class DenoiseWindow(tk.Toplevel):
             gt_psd_snr_label = ttk.Label(metrics_frame, text="")
             gt_psnr_label = ttk.Label(metrics_frame, text="")
             gt_rmse_label = ttk.Label(metrics_frame, text="")
+            gt_horiz_psd_snr_label = ttk.Label(metrics_frame, text="")
             # gt_metrics_frame remains None
 
         hist_widget = self.create_histogram(info_frame, image_data if image_data is not None else np.zeros((1,1)), title="Value Distribution")
@@ -596,6 +600,7 @@ class DenoiseWindow(tk.Toplevel):
                 'psd_fig': psd_fig, 'psd_ax': psd_ax, 'psd_canvas': psd_canvas,
                 'snr_psd_label': snr_psd_label,
                 'gt_snr_label': gt_snr_label, 'gt_psd_snr_label': gt_psd_snr_label, 'gt_rmse_label': gt_rmse_label, 'gt_psnr_label': gt_psnr_label,
+                'gt_horiz_psd_snr_label': gt_horiz_psd_snr_label,
                 'gt_metrics_frame': gt_metrics_frame,
                 'metrics': {}
             }
@@ -624,6 +629,7 @@ class DenoiseWindow(tk.Toplevel):
             'psd_fig': psd_fig, 'psd_ax': psd_ax, 'psd_canvas': psd_canvas,
             'snr_psd_label': snr_psd_label,
             'gt_snr_label': gt_snr_label, 'gt_psd_snr_label': gt_psd_snr_label, 'gt_rmse_label': gt_rmse_label, 'gt_psnr_label': gt_psnr_label,
+            'gt_horiz_psd_snr_label': gt_horiz_psd_snr_label,
             'gt_metrics_frame': gt_metrics_frame,
             'metrics': {}
         }
@@ -880,7 +886,8 @@ class DenoiseWindow(tk.Toplevel):
                     sigma=sigma_adjusted,
                     stage='all',
                     debug=True,
-                    callback=update_progress
+                    callback=update_progress,
+                    custom_params=custom_params
                 )
                 
                 # Close progress window
@@ -1505,6 +1512,7 @@ class DenoiseWindow(tk.Toplevel):
         gt_psd_snr_label = widget_info['gt_psd_snr_label']
         gt_rmse_label = widget_info['gt_rmse_label']
         gt_psnr_label = widget_info['gt_psnr_label']
+        gt_horiz_psd_snr_label = widget_info['gt_horiz_psd_snr_label']
         gt_metrics_frame = widget_info.get('gt_metrics_frame')
 
         widget_info['metrics'] = {} # Reset metrics for this update cycle
@@ -1527,6 +1535,8 @@ class DenoiseWindow(tk.Toplevel):
                 gt_rmse_label.config(text="RMSE: N/A")
             if hasattr(gt_psnr_label, 'winfo_ismapped') and gt_psnr_label.winfo_ismapped():
                 gt_psnr_label.config(text="PSNR: N/A")
+            if hasattr(gt_horiz_psd_snr_label, 'winfo_ismapped') and gt_horiz_psd_snr_label.winfo_ismapped():
+                gt_horiz_psd_snr_label.config(text="SNR - Horiz PSD: N/A")
             return
 
         # Determine the data slice based on current selection
@@ -1665,12 +1675,26 @@ class DenoiseWindow(tk.Toplevel):
                 else:
                     gt_rmse_label.config(text="RMSE: N/A")
                 
+                # Calculate and display the new Horizontal Line PSD SNR metric on the FULL image
+                horiz_snr_metrics = self.calculate_center_horizontal_line_psd_snr(image_data, self.clean_image_data)
+                widget_info['metrics'].update(horiz_snr_metrics)
+                horiz_snr_db = horiz_snr_metrics.get('horiz_psd_snr_db')
+
+                if horiz_snr_db is not None and not np.isnan(horiz_snr_db):
+                    if np.isinf(horiz_snr_db):
+                        gt_horiz_psd_snr_label.config(text=f"SNR - Horiz PSD: \u221E dB")
+                    else:
+                        gt_horiz_psd_snr_label.config(text=f"SNR - Horiz PSD: {horiz_snr_db:.2f} dB")
+                else:
+                    gt_horiz_psd_snr_label.config(text="SNR - Horiz PSD: N/A")
+                
             except Exception as e:
                 print(f"Error calculating ground truth metrics for {title}{region_label_psd}: {e}")
                 gt_snr_label.config(text="SNR - pixelwise: Error")
                 gt_psd_snr_label.config(text="SNR - PSD: Error")
                 gt_psnr_label.config(text="PSNR: Error")
                 gt_rmse_label.config(text="RMSE: Error")
+                gt_horiz_psd_snr_label.config(text="SNR - Horiz PSD: Error")
             
         # if no clean data, calculate residual metrics against original image
         elif self.clean_image_data is None and title != self.noisy_image_display_title:
@@ -2169,20 +2193,16 @@ class DenoiseWindow(tk.Toplevel):
 
     # ==================== Residual Analysis =====================
     def open_residual_analysis_window(self, denoised_title_str, denoised_image_data_full):
-        """
-        Open a window to analyze the residuals between images.
+        """Opens a popup for detailed residual analysis."""
+
+        # Residual of the denoised image
+        main_residual = self.image_data.astype(np.float64) - denoised_image_data_full.astype(np.float64)
+        main_metrics = self.calculate_residual_only_metrics(main_residual)
+        main_title = f"{denoised_title_str} Residual"
         
-        Cases:
-        1. Clean reference exists (NPZ files): show [denoised - clean] or [noisy - clean]
-        2. No clean reference (LBL/IMG pairs): show [original - denoised]
-        
-        Parameters:
-        -----------
-        denoised_title_str : str
-            Title of the denoised image method
-        denoised_image_data_full : ndarray
-            Full denoised image data array
-        """
+        comparison_residual = None
+        comparison_metrics = None
+
         try:
             if denoised_image_data_full is None:
                 tkinter.messagebox.showwarning("Missing Data", "No denoised image data available for analysis.")
@@ -2567,6 +2587,26 @@ class DenoiseWindow(tk.Toplevel):
         summary_window.title("Summary Plots")
         summary_window.geometry("1200x800")
 
+        # --- Controls for the summary window ---
+        top_controls_frame = ttk.Frame(summary_window)
+        top_controls_frame.pack(side='top', fill='x', padx=10, pady=(5,0))
+        
+        # Keep this an instance variable so it persists
+        if not hasattr(self, 'summary_padding_var'):
+            self.summary_padding_var = tk.StringVar(value="1.0")
+
+        padding_controls = ttk.Frame(top_controls_frame)
+        padding_controls.pack(side='right')
+
+        ttk.Label(padding_controls, text="Residual Plot Padding:").pack(side='left')
+        ttk.Entry(padding_controls, textvariable=self.summary_padding_var, width=5).pack(side='left', padx=(0,5))
+
+        def refresh_summary_plots():
+            summary_window.destroy()
+            self.generate_summary_plots()
+
+        ttk.Button(padding_controls, text="Update", command=refresh_summary_plots).pack(side='left')
+
         notebook = ttk.Notebook(summary_window)
         notebook.pack(expand=True, fill='both', padx=10, pady=10)
 
@@ -2830,7 +2870,7 @@ class DenoiseWindow(tk.Toplevel):
         # Ground truth noise: Noisy - Clean (if clean is available)
         if noisy_data is not None and clean_data is not None:
             if noisy_data.shape == clean_data.shape:
-                 residuals_to_plot.append({'title': 'Noisy - Clean (Ground Truth Noise)', 'data': noisy_data - clean_data})
+                 residuals_to_plot.append({'title': 'Noisy - Clean', 'data': noisy_data - clean_data})
         
         # What each filter removed: Noisy - Denoised
         if noisy_data is not None:
@@ -2838,7 +2878,7 @@ class DenoiseWindow(tk.Toplevel):
                 denoised_full_data = item['data']
                 denoised_data = get_slice(denoised_full_data)
                 if denoised_data is not None and noisy_data.shape == denoised_data.shape:
-                    residuals_to_plot.append({'title': f"Noisy - {item['title']} (Removed Component)", 'data': noisy_data - denoised_data})
+                    residuals_to_plot.append({'title': f"Noisy - {item['title']}", 'data': noisy_data - denoised_data})
 
         if not residuals_to_plot:
             # Pack label into parent_frame directly if no plots
@@ -2849,10 +2889,35 @@ class DenoiseWindow(tk.Toplevel):
         cols = 1
         rows = len(residuals_to_plot)
 
-        # Adjust figure height based on number of plots to make them readable
-        fig_height = 4 * rows 
-        fig_width = 8
-        fig = Figure(figsize=(fig_width, fig_height), dpi=100)
+        # --- Dynamic Figure Sizing to match aspect ratio ---
+        FIG_WIDTH_INCHES = 17  # A reasonable fixed width for the figure (10 * 1.7)
+        
+        try:
+            padding_per_plot = float(self.summary_padding_var.get())
+        except (ValueError, AttributeError):
+            padding_per_plot = 1.0 # Default fallback if var not set or invalid
+
+        PADDING_PER_PLOT_INCHES = padding_per_plot
+
+        # Get aspect ratio from the first image
+        h, w = residuals_to_plot[0]['data'].shape
+        aspect_ratio = h / w if w > 0 else 1.0
+        
+        # Calculate height for one plot's axes area
+        # The axes for the image will take up some portion of the figure width.
+        # The colorbar will also take some space. Let's assume the image axes get ~80% of width.
+        image_axes_height = (FIG_WIDTH_INCHES * 0.8) * aspect_ratio
+
+        # Total figure height is sum of plot heights plus padding
+        fig_height_inches = rows * (image_axes_height + PADDING_PER_PLOT_INCHES)
+
+        # Make sure the figure is not absurdly tall if aspect ratio is > 1
+        fig_height_inches = min(fig_height_inches, rows * 13.6) # Cap at 8 * 1.7 inches per plot
+
+        # And ensure it's not too small
+        fig_height_inches = max(fig_height_inches, rows * 4.25) # Min 2.5 * 1.7 inches per plot
+
+        fig = Figure(figsize=(FIG_WIDTH_INCHES, fig_height_inches), dpi=100)
 
         for i, res_item in enumerate(residuals_to_plot):
             ax = fig.add_subplot(rows, cols, i + 1)
@@ -2861,8 +2926,8 @@ class DenoiseWindow(tk.Toplevel):
             # Use minmax scaling for residual display
             disp_img = create_display_image(residual_image, method='minmax')
             
-            im = ax.imshow(disp_img, cmap='gray', aspect='auto')
-            ax.set_title(res_item['title'], fontsize=26)
+            im = ax.imshow(disp_img, cmap='gray', aspect='equal')
+            ax.set_title(res_item['title'], fontsize=16)
             ax.axis('off')
             cbar = fig.colorbar(im, ax=ax)
             cbar.ax.tick_params(labelsize=18)
@@ -3012,6 +3077,40 @@ class DenoiseWindow(tk.Toplevel):
 
         # Don't plot the DC component (frequency 0)
         return frequencies[1:], power_spectrum[1:]
+
+    def calculate_center_horizontal_line_psd_snr(self, input_image, clean_image):
+        """
+        Calculate SNR based on the PSD of the center horizontal line of the full images.
+        """
+        if input_image is None or clean_image is None or input_image.shape != clean_image.shape:
+            return {'horiz_psd_snr_db': np.nan}
+
+        # Get PSD for both images from their center line
+        input_freqs, input_psd = self.calculate_center_horizontal_psd(input_image)
+        clean_freqs, clean_psd = self.calculate_center_horizontal_psd(clean_image)
+
+        if input_psd is None or clean_psd is None or len(input_psd) != len(clean_psd):
+            return {'horiz_psd_snr_db': np.nan}
+
+        # Calculate total power
+        p_signal = np.sum(clean_psd)
+        p_noise = np.sum(np.abs(input_psd - clean_psd))
+
+        # Calculate SNR
+        if p_noise < 1e-12:
+            snr_linear = np.inf
+        else:
+            snr_linear = p_signal / p_noise
+
+        # Convert to dB
+        if np.isinf(snr_linear):
+            snr_db = np.inf
+        elif snr_linear > 0:
+            snr_db = 10 * np.log10(snr_linear)
+        else:
+            snr_db = -np.inf
+
+        return {'horiz_psd_snr_db': snr_db}
 
     def _create_summary_psd_error_plot(self, parent_frame, data_coords, region_label):
         plot_data = self._get_plot_data()
