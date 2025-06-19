@@ -258,14 +258,19 @@ class DenoiseWindow(tk.Toplevel):
         ttk.Label(tv_params_frame, text="(Required)").grid(row=0, column=2, sticky="w")
 
         # New C_tv (multiplier for Weight = C_tv * Sigma)
-        ttk.Label(tv_params_frame, text="C_tv (Weight=C_tv*Sigma):").grid(row=1, column=0, sticky="w")
-        self.tv_c_var = tk.StringVar(value="10.0") # Default for C_tv
+        ttk.Label(tv_params_frame, text="C_tv (λ ≈ 1/(Ctv*σ)):").grid(row=1, column=0, sticky="w")
+        self.tv_c_var = tk.StringVar(value="80.0") # Default for C_tv, gives lambda ~1
         ttk.Entry(tv_params_frame, textvariable=self.tv_c_var, width=8).grid(row=1, column=1, padx=5)
 
         # Max iterations
         ttk.Label(tv_params_frame, text="Max iter:").grid(row=2, column=0, sticky="w")
         self.tv_max_iter_var = tk.StringVar(value="200")
         ttk.Entry(tv_params_frame, textvariable=self.tv_max_iter_var, width=8).grid(row=2, column=1, padx=5)
+
+        # Convergence tolerance
+        ttk.Label(tv_params_frame, text="Tolerance:").grid(row=3, column=0, sticky="w")
+        self.tv_tolerance_var = tk.StringVar(value="1e-4")
+        ttk.Entry(tv_params_frame, textvariable=self.tv_tolerance_var, width=8).grid(row=3, column=1, padx=5)
 
         # NLM Denoising
         self.nlm_var = tk.BooleanVar(value=False)
@@ -926,6 +931,7 @@ class DenoiseWindow(tk.Toplevel):
                 tv_sigma_str = self.tv_sigma_var.get().strip()
                 tv_c_str = self.tv_c_var.get().strip()
                 max_iter = int(self.tv_max_iter_var.get())
+                tolerance = float(self.tv_tolerance_var.get())
 
                 if not tv_sigma_str:
                     tkinter.messagebox.showerror("TV Error", "Sigma (Noise STD) must be provided for Total Variation.")
@@ -954,13 +960,14 @@ class DenoiseWindow(tk.Toplevel):
                     return
                 
                 # Adjust sigma based on the percentile scaling factor used for the image data `arr`
-                sigma_adjusted_for_weight_calc = tv_sigma_val / self.scale_factor if self.rescale_var.get() else tv_sigma_val
+                sigma_adjusted = tv_sigma_val / self.scale_factor if self.rescale_var.get() else tv_sigma_val
                 
-                weight = tv_c_val * sigma_adjusted_for_weight_calc
+                # Higher Ctv means more smoothing, which means a smaller lambda
+                lambda_val = 1.0 / (tv_c_val * sigma_adjusted)
                 
-                print(f"Applying Total Variation (ROF): User Sigma={tv_sigma_val:.4f}, C_tv={tv_c_val:.2f}, Calculated Weight={weight:.4f}, Max Iter={max_iter}")
+                print(f"Applying Total Variation (Bregman): User Sigma={tv_sigma_val:.4f}, C_tv={tv_c_val:.2f}, Calculated λ={lambda_val:.4f}, Max Iter={max_iter}, Tolerance={tolerance:.2e}")
                 # Apply Total Variation to the *potentially scaled* data 'arr'
-                den_scaled = total_variation.tv_denoise(arr, weight=weight, max_iter=max_iter)
+                den_scaled = total_variation.tv_denoise(arr, lambda_param=lambda_val, max_iter=max_iter, tolerance=tolerance)
                 
                 # Maintain consistent scaling approach
                 if self.rescale_var.get():

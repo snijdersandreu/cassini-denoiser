@@ -1,78 +1,150 @@
 import numpy as np
+from scipy.fft import fft2, ifft2
 
-def tv_denoise(img, weight=0.1, max_iter=100, tolerance=1e-4):
+def _grad(u):
     """
-    Apply Total Variation (TV) denoising to a 2D image using the ROF model.
+    Computes the forward gradient of a 2D image u.
+    Uses forward differences with Neumann boundary conditions.
+    """
+    h, w = u.shape
+    g = np.zeros((h, w, 2), dtype=u.dtype)
     
-    This implements the Rudin-Osher-Fatemi (ROF) total variation denoising model
-    using an iterative algorithm. TV denoising preserves edges while removing noise.
+    # x-gradient
+    g[:, :-1, 0] = u[:, 1:] - u[:, :-1]
+    
+    # y-gradient
+    g[:-1, :, 1] = u[1:, :] - u[:-1, :]
+    
+    return g
+
+def _div(d):
+    """
+    Computes the backward divergence of a 2D vector field d.
+    Uses backward differences with Neumann boundary conditions.
+    This is the negative adjoint of the _grad function.
+    """
+    h, w = d.shape[:2]
+    div_d = np.zeros((h, w), dtype=d.dtype)
+    
+    # Divergence of x-component
+    dx = d[:, :, 0]
+    div_d[:, 1:] += dx[:, :-1]
+    div_d[:, 0] += dx[:, 0]
+    div_d[:, 1:] -= dx[:, 1:]
+
+    # Divergence of y-component
+    dy = d[:, :, 1]
+    div_d[1:, :] += dy[:-1, :]
+    div_d[0, :] += dy[0, :]
+    div_d[1:, :] -= dy[1:, :]
+    
+    return div_d
+    
+def _shrink(x, t):
+    """
+    Vectorial shrinkage (soft-thresholding) for anisotropic TV.
+    """
+    # For each pixel, shrink the magnitude of the gradient vector
+    norm_x = np.sqrt(x[..., 0]**2 + x[..., 1]**2)
+    # Avoid division by zero
+    norm_x[norm_x == 0] = 1
+    
+    # Shrinkage factor
+    factor = np.maximum(norm_x - t, 0) / norm_x
+    
+    # Apply shrinkage
+    shrunk_x = x * factor[..., np.newaxis]
+    
+    return shrunk_x
+
+def tv_denoise(img, lambda_param=10.0, max_iter=100, tolerance=1e-4):
+    """
+    Apply Total Variation (TV) denoising using the Split Bregman method.
+    
+    This implements the Split Bregman optimization for the Rudin-Osher-Fatemi (ROF)
+    model, which minimizes the following cost function:
+    
+        min_u TV(u) + (lambda_param / 2) * ||u - f||^2
+    
+    This method is efficient and robust for edge-preserving noise removal.
     
     Parameters:
     -----------
     img : ndarray
-        Input image (2D numpy array)
-    weight : float
-        Regularization parameter. Higher values = more smoothing.
-        Typical range: 0.01 to 1.0
+        Input image (2D numpy array).
+    lambda_param : float
+        Regularization parameter (lambda). Controls the trade-off between
+        noise removal and fidelity to the original image.
+        Higher values = less smoothing (more fidelity to original).
+        Lower values = more smoothing.
     max_iter : int
-        Maximum number of iterations
+        Maximum number of iterations.
     tolerance : float
-        Convergence tolerance
+        Convergence tolerance. The algorithm stops when the relative change
+        in the solution `u` is below this value.
         
     Returns:
     --------
     denoised_img : ndarray
-        Denoised image
+        Denoised image.
     """
-    # Ensure image is float
     img = np.asarray(img, dtype=np.float64)
+    if img.ndim != 2:
+        raise ValueError("Input image must be a 2D array.")
+
+    h, w = img.shape
     
-    # Get image dimensions
-    rows, cols = img.shape
+    # Algorithm parameters from the Split Bregman paper
+    # The fidelity term is (lambda_param / 2) * ||u - f||^2.
+    mu = 2.0 * lambda_param  # A common choice for the penalty parameter
+
+    # Pre-compute FFT of the identity and gradient operators
+    F_f = fft2(img)
     
-    # Initialize the denoised image
+    # PSF for gradient operators
+    psf_x = np.zeros_like(img)
+    psf_x[0, 0] = -1
+    psf_x[0, 1] = 1
+    psf_y = np.zeros_like(img)
+    psf_y[0, 0] = -1
+    psf_y[1, 0] = 1
+    
+    F_dx = fft2(psf_x)
+    F_dy = fft2(psf_y)
+    
+    # Denominator for the u-subproblem
+    denom = lambda_param + mu * (np.conj(F_dx) * F_dx + np.conj(F_dy) * F_dy)
+
+    # Initialize variables
     u = img.copy()
-    
-    # Dual variables for the TV optimization
-    p = np.zeros((rows, cols, 2))
-    
-    # Time step for the algorithm
-    dt = 0.25
-    
-    for iteration in range(max_iter):
+    d = np.zeros((h, w, 2), dtype=img.dtype)
+    b = np.zeros((h, w, 2), dtype=img.dtype)
+
+    for i in range(max_iter):
         u_old = u.copy()
         
-        # Compute gradient of u
-        grad_u = np.zeros((rows, cols, 2))
+        # --- u-subproblem: solve for u ---
+        # This is a screened Poisson equation, solved efficiently in Fourier domain.
+        # RHS = lambda*f + mu*div(d-b)
+        rhs_div = _div(d - b)
+        F_rhs = lambda_param * F_f + mu * fft2(rhs_div)
+        F_u = F_rhs / denom
+        u = np.real(ifft2(F_u))
         
-        # Forward differences for gradient computation
-        grad_u[:-1, :, 0] = u[1:, :] - u[:-1, :]  # vertical gradient
-        grad_u[:, :-1, 1] = u[:, 1:] - u[:, :-1]  # horizontal gradient
+        # --- d-subproblem: solve for d ---
+        # This is a vectorial shrinkage operation.
+        grad_u = _grad(u)
+        d = _shrink(grad_u + b, 1.0 / mu)
         
-        # Update dual variable p
-        p_new = p + dt * grad_u
+        # --- b-update: update Bregman variable ---
+        b = b + (grad_u - d)
         
-        # Normalize p to satisfy |p| <= 1
-        p_norm = np.sqrt(p_new[:, :, 0]**2 + p_new[:, :, 1]**2)
-        p_norm = np.maximum(p_norm, 1.0)
-        p[:, :, 0] = p_new[:, :, 0] / p_norm
-        p[:, :, 1] = p_new[:, :, 1] / p_norm
-        
-        # Compute divergence of p
-        div_p = np.zeros((rows, cols))
-        
-        # Backward differences for divergence computation
-        div_p[1:, :] += p[1:, :, 0] - p[:-1, :, 0]  # vertical component
-        div_p[:, 1:] += p[:, 1:, 1] - p[:, :-1, 1]  # horizontal component
-        div_p[0, :] += p[0, :, 0]  # boundary condition
-        div_p[:, 0] += p[:, 0, 1]  # boundary condition
-        
-        # Update u using the ROF model
-        u = img + weight * div_p
-        
-        # Check for convergence
-        change = np.mean(np.abs(u - u_old))
+        # --- Check for convergence ---
+        change = np.linalg.norm(u - u_old, 'fro') / np.linalg.norm(u, 'fro')
         if change < tolerance:
+            print(f"TV Bregman converged at iteration {i+1} with change {change:.2e} < tolerance {tolerance:.2e}")
             break
-    
+    else:
+        print(f"TV Bregman reached max_iter={max_iter} without converging to tolerance={tolerance:.2e}. Final change: {change:.2e}")
+
     return u 
